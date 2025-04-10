@@ -3,7 +3,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 from itertools import islice
-
+from flax import nnx
+from utils import Upsample, Downsample
 from utils import exists, noop, is_odd, default, cycle, prob_mask_like
 
 # --- Test exists ---
@@ -122,3 +123,47 @@ def test_prob_mask_like_invalid_prob():
     mask_under = prob_mask_like(shape, -0.5)
     assert mask_under.shape == shape
     assert mask_under.dtype == jnp.bool_
+
+
+@pytest.fixture
+def rngs():
+  """Provides nnx.Rngs for Upsample/Downsample tests."""
+  return nnx.Rngs(0)
+
+
+def test_upsample(rngs):
+    """Tests the Upsample function (ConvTranspose wrapper)."""
+    dim = 16
+    b, f, h, w = 2, 1, 10, 10 # Using f=1 for simplicity
+    input_shape = (b, f, h, w, dim) # Channels last
+    key = jax.random.PRNGKey(7)
+    x = jax.random.normal(key, input_shape)
+
+    # Initialize Upsample module
+    upsample_layer = Upsample(dim=dim, rngs=rngs)
+
+
+    output = upsample_layer(x)
+
+    # Assertions
+    expected_output_shape = (b, 1, 20, 20, dim)
+    assert output.shape == expected_output_shape
+    assert output.dtype == x.dtype
+
+def test_downsample(rngs):
+    """Tests the Downsample function (Conv wrapper)."""
+    dim = 16
+    b, f, h, w = 2, 1, 10, 10 # Using f=1 for simplicity
+    input_shape = (b, f, h, w, dim) # Channels last
+    key = jax.random.PRNGKey(8)
+    x = jax.random.normal(key, input_shape)
+
+    # Initialize Downsample module
+    downsample_layer = Downsample(dim=dim, rngs=rngs)
+
+    output = downsample_layer(x)
+
+    # Assertions
+    expected_output_shape = (b, 1, 5, 5, dim)
+    assert output.shape == expected_output_shape
+    assert output.dtype == x.dtype
