@@ -176,4 +176,118 @@ def test_block(rngs):
     shift = jnp.zeros((1, 1, 1, out_features)) # Example shift
     output_with_ss = block_module(x, scale_shift=(scale, shift))
     assert output_with_ss.shape == expected_output_shape
-    assert output_with_ss.dtype == x.dtype 
+    assert output_with_ss.dtype == x.dtype
+
+def test_identity(rngs):
+    """Tests the Identity module."""
+    dim = 10
+    batch_size = 4
+    input_shape = (batch_size, dim)
+    key = jax.random.PRNGKey(7)
+    x = jax.random.normal(key, input_shape)
+
+    identity_module = modules.Identity()
+    output = identity_module(x)
+
+    assert output.shape == input_shape
+    assert output.dtype == x.dtype
+    assert jnp.allclose(output, x)
+
+def test_resnet_block(rngs):
+    """Tests the ResnetBlock module."""
+    in_features = 16
+    out_features = 32
+    groups = 8
+    b, f, h, w = 2, 3, 10, 10 # Batch, frames, height, width
+    input_shape = (b, f, h, w, in_features) # NNX Conv requires channels last
+    key = jax.random.PRNGKey(8)
+    x = jax.random.normal(key, input_shape)
+
+    # Test without time embedding
+    resnet_block_no_time = modules.ResnetBlock(in_features=in_features,
+                                               out_features=out_features,
+                                               rngs=rngs,
+                                               groups=groups,
+                                               time_emb_dim=None)
+    output_no_time = resnet_block_no_time(x)
+    expected_shape = (b, f, h, w, out_features)
+    assert output_no_time.shape == expected_shape
+    assert output_no_time.dtype == x.dtype
+
+    # Test with time embedding
+    time_emb_dim = 64
+    time_key = jax.random.PRNGKey(9)
+    time_emb = jax.random.normal(time_key, (b, time_emb_dim)) # One time emb per batch item
+
+    resnet_block_with_time = modules.ResnetBlock(in_features=in_features,
+                                                 out_features=out_features,
+                                                 rngs=rngs,
+                                                 groups=groups,
+                                                 time_emb_dim=time_emb_dim)
+    output_with_time = resnet_block_with_time(x, time_embed=time_emb)
+    assert output_with_time.shape == expected_shape
+    assert output_with_time.dtype == x.dtype
+
+    # Test with in_features == out_features
+    resnet_block_same_dims = modules.ResnetBlock(in_features=out_features, # Use out_features as in_features
+                                                 out_features=out_features,
+                                                 rngs=rngs,
+                                                 groups=groups,
+                                                 time_emb_dim=None)
+    output_same_dims = resnet_block_same_dims(output_no_time) # Use output from previous block
+    assert output_same_dims.shape == expected_shape
+    assert output_same_dims.dtype == output_no_time.dtype
+
+def test_multihead_attention(rngs):
+    """Tests the MultiheadAttention module."""
+    in_features = 32
+    dim_head = 8 # Dimension per head
+    num_heads = 4
+    b, f, h, w = 2, 5, 6, 7 # Batch, frames, height, width (used to construct input)
+    # Input shape expected: (... , frames, features)
+    input_shape = (b, h, w, f, in_features) # Example shape with spatial dims flattened
+    key = jax.random.PRNGKey(10)
+    x = jax.random.normal(key, input_shape)
+
+    # Initialize MultiheadAttention module
+    attn_module = modules.MultiheadAttention(in_features=in_features,
+                                             dim=dim_head,
+                                             num_heads=num_heads,
+                                             rngs=rngs)
+
+    # Run the forward pass
+    output = attn_module(x)
+
+    # Assertions
+    assert output.shape == input_shape
+    assert output.dtype == x.dtype
+
+    # Test with focus present mask
+    mask_key = jax.random.PRNGKey(11)
+    focus_present_mask = jax.random.choice(mask_key, jnp.array([True, False]), (b,))
+    output_masked = attn_module(x, focus_present_mask=focus_present_mask)
+    assert output_masked.shape == input_shape
+    assert output_masked.dtype == x.dtype
+
+def test_relative_position_bias(rngs):
+    """Tests the RelativePositionBias module."""
+    heads = 8
+    num_buckets = 32
+    max_distance = 128
+    seq_len = 10 # Example sequence length (e.g., number of frames)
+
+    # Initialize RelativePositionBias module
+    bias_module = modules.RelativePositionBias(rngs=rngs,
+                                               heads=heads,
+                                               num_buckets=num_buckets,
+                                               max_distance=max_distance)
+
+    # Run the forward pass
+    output_bias = bias_module(n=seq_len)
+
+    # Assertions
+    # Expected shape: (heads, seq_len, seq_len)
+    expected_shape = (heads, seq_len, seq_len)
+    assert output_bias.shape == expected_shape
+    # Bias should be float
+    assert output_bias.dtype == jnp.float32 or output_bias.dtype == jnp.float16 # Depending on default nnx Embed dtype 
