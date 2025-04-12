@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 import modules  # Import the module containing your classes
+# import unet3d # Removed as tests are moved
 
 @pytest.fixture
 def rngs():
@@ -290,4 +291,4 @@ def test_relative_position_bias(rngs):
     expected_shape = (heads, seq_len, seq_len)
     assert output_bias.shape == expected_shape
     # Bias should be float
-    assert output_bias.dtype == jnp.float32 or output_bias.dtype == jnp.float16 # Depending on default nnx Embed dtype 
+    assert output_bias.dtype == jnp.float32 or output_bias.dtype == jnp.float16 # Depending on default nnx Embed dtype
