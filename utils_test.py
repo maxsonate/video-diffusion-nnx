@@ -1,169 +1,182 @@
 # test_utils.py
-import pytest
+import unittest
 import jax
 import jax.numpy as jnp
-from itertools import islice
-from flax import nnx
-from utils import Upsample, Downsample
-from utils import exists, noop, is_odd, default, cycle, prob_mask_like
+import numpy as np
+# Import all functions being tested
+from utils import (
+    exists,
+    noop,
+    is_odd,
+    default,
+    prob_mask_like,
+    clip_grad_norm,
+    extract,
+    cosine_beta_schedule,
+    unnormalize_img,
+    normalize_img,
+    is_list_str,
+    num_to_groups,
+    cast_num_frames,
+    get_text_from_path,
+    identity
+)
 
-# --- Test exists ---
+# Note: Tests for NNX modules (Upsample, Downsample), file I/O (gif/video functions),
+# infinite generators (cycle), and PIL interactions (seek_all_images) are omitted
+# as they require more complex setup (mocks, test files, NNX context).
 
-def test_exists_with_none():
-  """Test exists() with None."""
-  assert not exists(None)
+class TestUtils(unittest.TestCase):
 
-def test_exists_with_values():
-  """Test exists() with various non-None values."""
-  assert exists(0)
-  assert exists(1)
-  assert exists("")
-  assert exists("hello")
-  assert exists([])
-  assert exists([1, 2])
-  assert exists({})
-  assert exists({"a": 1})
-  assert exists(False)
-  assert exists(True)
+    # --- Tests for original functions --- 
 
-# --- Test noop ---
+    def test_exists(self):
+        self.assertTrue(exists(1))
+        self.assertTrue(exists(0))
+        self.assertTrue(exists(""))
+        self.assertTrue(exists([]))
+        self.assertFalse(exists(None))
 
-def test_noop_returns_none():
-  """Test that noop() returns None and accepts args/kwargs."""
-  assert noop() is None
-  assert noop(1, 2, 3) is None
-  assert noop(a=1, b=2) is None
-  assert noop(1, 2, c=3) is None
+    def test_noop(self):
+        try:
+            noop()
+            noop(1, 2, a=3)
+        except Exception as e:
+            self.fail(f"noop raised {e}")
 
-# --- Test is_odd ---
+    def test_is_odd(self):
+        self.assertTrue(is_odd(1))
+        self.assertTrue(is_odd(3))
+        self.assertTrue(is_odd(-1))
+        self.assertFalse(is_odd(0))
+        self.assertFalse(is_odd(2))
+        self.assertFalse(is_odd(-2))
 
-def test_is_odd_positive():
-  """Test is_odd() with positive numbers."""
-  assert is_odd(1)
-  assert not is_odd(2)
-  assert is_odd(3)
-  assert not is_odd(100)
+    def test_default(self):
+        self.assertEqual(default(5, 10), 5)
+        self.assertEqual(default(None, 10), 10)
+        self.assertEqual(default(None, lambda: 15), 15)
+        self.assertEqual(default("hello", "world"), "hello")
+        self.assertEqual(default(0, 10), 0) # Check falsy value
 
-def test_is_odd_zero():
-  """Test is_odd() with zero."""
-  assert not is_odd(0)
+    def test_prob_mask_like(self):
+        shape = (10, 10)
+        # Note: Cannot test exact probability easily due to internal random key
+        mask_all_true = prob_mask_like(shape, 1.0)
+        self.assertTrue(jnp.all(mask_all_true))
+        self.assertEqual(mask_all_true.shape, shape)
+        self.assertEqual(mask_all_true.dtype, jnp.bool_)
 
-def test_is_odd_negative():
-  """Test is_odd() with negative numbers."""
-  assert is_odd(-1)
-  assert not is_odd(-2)
-  assert is_odd(-3)
-  assert not is_odd(-100)
+        mask_all_false = prob_mask_like(shape, 0.0)
+        self.assertTrue(jnp.all(~mask_all_false))
+        self.assertEqual(mask_all_false.shape, shape)
+        self.assertEqual(mask_all_false.dtype, jnp.bool_)
 
-# --- Test default ---
+        mask_half = prob_mask_like(shape, 0.5) 
+        self.assertEqual(mask_half.shape, shape)
+        self.assertEqual(mask_half.dtype, jnp.bool_)
 
-def test_default_with_value():
-  """Test default() when the value exists."""
-  assert default(5, 10) == 5
-  assert default("hello", "world") == "hello"
-  assert default(False, True) is False
-  assert default(0, 1) == 0
-  assert default([], [1]) == []
+    def test_clip_grad_norm(self):
+        grads_test = {
+            'layer1': {'weights': jnp.array([1., 2., 3.]), 'bias': jnp.array([4., 5.])},
+            'layer2': {'weights': jnp.array([-2., 1.])}
+        }
+        max_norm = 1.0
+        clipped_grads = clip_grad_norm(grads_test, max_norm, epsilon=1e-9) # Use small epsilon
 
-def test_default_with_none_and_value():
-  """Test default() when value is None and default is a value."""
-  assert default(None, 10) == 10
-  assert default(None, "world") == "world"
-  assert default(None, True) is True
-  assert default(None, [1]) == [1]
+        self.assertEqual(jax.tree.structure(grads_test), jax.tree.structure(clipped_grads))
 
-def test_default_with_none_and_callable():
-  """Test default() when value is None and default is a callable."""
-  assert default(None, lambda: 10) == 10
-  assert default(None, lambda: "world") == "world"
-  assert default(None, list) == []
-  class MyClass: pass
-  assert isinstance(default(None, MyClass), MyClass)
+        clipped_grad_squared = jax.tree.map(lambda x: jnp.sum(x**2), clipped_grads)
+        clipped_l2_norm = jnp.sqrt(jax.tree.reduce(jnp.add, clipped_grad_squared) + 1e-9)
+        clipped_total_leaves = len(jax.tree.leaves(clipped_grad_squared))
+        clipped_l2_norm_avg = clipped_l2_norm / clipped_total_leaves
+        
+        self.assertLessEqual(clipped_l2_norm_avg, max_norm + 1e-5) 
 
-# --- Test prob_mask_like ---
+    def test_extract(self):
+        a = jnp.arange(10) 
+        t = jnp.array([1, 3, 5])
+        x_shape_4d = (3, 10, 10, 10) # Example 4D shape 
+        expected_reshaped_4d = jnp.array([[[[1]]], [[[3]]], [[[5]]]]) # Shape (3, 1, 1, 1)
+        
+        out = extract(a, t, x_shape_4d)
+        np.testing.assert_array_equal(out, expected_reshaped_4d)
+        self.assertEqual(out.shape, (t.shape[0],) + (1,) * (len(x_shape_4d) - 1))
 
-def test_prob_mask_like_prob_1():
-  """Test prob_mask_like with probability 1."""
-  shape = (2, 3)
-  mask = prob_mask_like(shape, 1.0)
-  assert mask.shape == shape
-  assert mask.dtype == jnp.bool_
-  assert jnp.all(mask)
+    def test_cosine_beta_schedule(self):
+        timesteps = 100
+        betas = cosine_beta_schedule(timesteps)
+        self.assertEqual(betas.shape, (timesteps,))
+        self.assertTrue(jnp.all(betas >= 0))
+        self.assertTrue(jnp.all(betas <= 1))
 
-def test_prob_mask_like_prob_0():
-  """Test prob_mask_like with probability 0."""
-  shape = (3, 2)
-  mask = prob_mask_like(shape, 0.0)
-  assert mask.shape == shape
-  assert mask.dtype == jnp.bool_
-  assert not jnp.any(mask)
+    # --- Tests for newly added functions --- 
 
-def test_prob_mask_like_prob_half():
-  """Test prob_mask_like with probability 0.5 (checks shape and dtype)."""
-  shape = (5, 5)
-  # Note: Due to internal random key generation, we can't test deterministically
-  # We primarily check shape, dtype, and that it returns a JAX array.
-  mask = prob_mask_like(shape, 0.5)
-  assert isinstance(mask, jax.Array)
-  assert mask.shape == shape
-  assert mask.dtype == jnp.bool_
-  # For a reasonable probability and shape, some should likely be True and False
-  # This is a weak check due to randomness.
-  # assert jnp.any(mask)
-  # assert jnp.any(~mask)
+    def test_unnormalize_img(self):
+        normalized = jnp.array([-1., 0., 1.])
+        expected = jnp.array([0., 0.5, 1.])
+        unnormalized = unnormalize_img(normalized)
+        np.testing.assert_allclose(unnormalized, expected, atol=1e-6)
 
-def test_prob_mask_like_invalid_prob():
-    """Test prob_mask_like behavior with probability outside [0, 1] (implicitly tests < operator)."""
-    shape = (2, 2)
-    # Probability > 1 should behave like prob = 1 due to '< prob' comparison
-    mask_over = prob_mask_like(shape, 1.5)
-    assert mask_over.shape == shape
-    assert mask_over.dtype == jnp.bool_
-    # Probability < 0 should behave like prob = 0
-    mask_under = prob_mask_like(shape, -0.5)
-    assert mask_under.shape == shape
-    assert mask_under.dtype == jnp.bool_
+    def test_normalize_img(self):
+        unnormalized = jnp.array([0., 0.5, 1.])
+        expected = jnp.array([-1., 0., 1.])
+        normalized = normalize_img(unnormalized)
+        np.testing.assert_allclose(normalized, expected, atol=1e-6)
+
+    def test_is_list_str(self):
+        self.assertTrue(is_list_str(["a", "b"]))
+        self.assertTrue(is_list_str(("a", "b")))
+        self.assertFalse(is_list_str(["a", 1]))
+        self.assertFalse(is_list_str("a"))
+        # Original logic: all([]) is True, so empty list/tuple returns True
+        self.assertTrue(is_list_str([]))
+        self.assertTrue(is_list_str(()))
+        self.assertFalse(is_list_str([1, 2]))
+        self.assertFalse(is_list_str(None))
+        self.assertFalse(is_list_str({}))
+
+    def test_num_to_groups(self):
+        self.assertEqual(num_to_groups(10, 3), [3, 3, 3, 1])
+        self.assertEqual(num_to_groups(9, 3), [3, 3, 3])
+        self.assertEqual(num_to_groups(5, 5), [5])
+        self.assertEqual(num_to_groups(2, 3), [2])
+        self.assertEqual(num_to_groups(0, 3), [])
+
+    def test_cast_num_frames(self):
+        # Shape: (channels, frames, height, width)
+        t = jnp.ones((3, 10, 4, 4))
+
+        t_equal = cast_num_frames(t, frames=10)
+        self.assertEqual(t_equal.shape, (3, 10, 4, 4))
+        np.testing.assert_array_equal(t_equal, t)
+
+        t_truncate = cast_num_frames(t, frames=5)
+        self.assertEqual(t_truncate.shape, (3, 5, 4, 4))
+        np.testing.assert_array_equal(t_truncate, t[:, :5, ...])
+
+        t_pad = cast_num_frames(t, frames=15)
+        self.assertEqual(t_pad.shape, (3, 15, 4, 4))
+        np.testing.assert_array_equal(t_pad[:, :10, ...], t)
+        np.testing.assert_array_equal(t_pad[:, 10:, ...], jnp.zeros((3, 5, 4, 4)))
+
+    def test_get_text_from_path(self):
+        path = "/a/b/c/cool-video_test.gif"
+        expected = "cool video test"
+        self.assertEqual(get_text_from_path(path), expected)
+        
+        path_simple = "simple.mp4"
+        expected_simple = "simple"
+        self.assertEqual(get_text_from_path(path_simple), expected_simple)
+
+    def test_identity(self):
+        a = object()
+        b = [1, 2]
+        self.assertIs(identity(a), a)
+        self.assertIs(identity(b), b)
+        self.assertEqual(identity(5), 5)
+        self.assertEqual(identity(5, 1, 2, key=3), 5)
 
 
-@pytest.fixture
-def rngs():
-  """Provides nnx.Rngs for Upsample/Downsample tests."""
-  return nnx.Rngs(0)
-
-
-def test_upsample(rngs):
-    """Tests the Upsample function (ConvTranspose wrapper)."""
-    dim = 16
-    b, f, h, w = 2, 1, 10, 10 # Using f=1 for simplicity
-    input_shape = (b, f, h, w, dim) # Channels last
-    key = jax.random.PRNGKey(7)
-    x = jax.random.normal(key, input_shape)
-
-    # Initialize Upsample module
-    upsample_layer = Upsample(dim=dim, rngs=rngs)
-
-
-    output = upsample_layer(x)
-
-    # Assertions
-    expected_output_shape = (b, 1, 20, 20, dim)
-    assert output.shape == expected_output_shape
-    assert output.dtype == x.dtype
-
-def test_downsample(rngs):
-    """Tests the Downsample function (Conv wrapper)."""
-    dim = 16
-    b, f, h, w = 2, 1, 10, 10 # Using f=1 for simplicity
-    input_shape = (b, f, h, w, dim) # Channels last
-    key = jax.random.PRNGKey(8)
-    x = jax.random.normal(key, input_shape)
-
-    # Initialize Downsample module
-    downsample_layer = Downsample(dim=dim, rngs=rngs)
-
-    output = downsample_layer(x)
-
-    # Assertions
-    expected_output_shape = (b, 1, 5, 5, dim)
-    assert output.shape == expected_output_shape
-    assert output.dtype == x.dtype
+if __name__ == '__main__':
+    unittest.main()

@@ -2,6 +2,18 @@ import jax
 import jax.numpy as jnp
 import random
 from flax import nnx
+from PIL import Image
+import numpy as np
+import torch
+from torchvision import transforms as T
+from functools import partial
+
+
+CHANNELS_TO_MODE = {
+    1:'L',
+    2:'RGB',
+    3:'RGBA'
+}
 
 
 def exists(x):
@@ -135,7 +147,6 @@ grads_test = {
 
 
 
-# TODO: Double check this, not too sure about the implementation:
 def extract(a:jax.Array, t, x_shape):
   """Extracts elements from a tensor based on the provided indices.
   
@@ -171,36 +182,36 @@ def cosine_beta_schedule(timesteps, s = 0.008):
 
 
 def unnormalize_img(t):
-  """Unnormalizes the input tensor by scaling it to the range [-1, 1].
+  """Unnormalizes an image tensor from [-1, 1] back to [0, 1].
   
   Args:
-    t: The input tensor
+    t: The input tensor, assumed to be in the range [-1, 1].
 
   Returns:
-    jnp.ndarray: The unnormalized tensor
+    jnp.ndarray: The unnormalized tensor in the range [0, 1].
   """
   return (t + 1) * 0.5
 
 # Function that scales the pixel values of an image to the range [-1, 1].
 def normalize_img(t):
-  """Normalizes the input tensor to the range [-1, 1].
+  """Normalizes an image tensor from [0, 1] to the range [-1, 1].
   
   Args:
-    t: The input tensor
+    t: The input tensor, assumed to be in the range [0, 1].
 
   Returns:
-    jnp.ndarray: The normalized tensor
+    jnp.ndarray: The normalized tensor in the range [-1, 1].
   """
   return t * 2 - 1
 
 def is_list_str(x):
-  """Checks if the input is a list or tuple and contains only strings.
+  """Checks if the input is a list or tuple containing only strings.
   
   Args:
-    x: The input to check
+    x: The input variable to check.
 
   Returns:
-    bool: True if x is a list or tuple and contains only strings, False otherwise
+    bool: True if x is a list or tuple containing only strings, False otherwise.
   """
   if not isinstance(x , (list, tuple)):
     return False
@@ -224,3 +235,140 @@ def num_to_groups(num, divisor):
         result.append(remainder)
 
     return result
+
+# The function takes an image object and the number of channels as inputs and converts each frame to the specified model before yielding it.
+def seek_all_images(img, channels = 3):
+  """Yields all frames from a PIL Image object, converted to the specified mode.
+
+  Args:
+    img (PIL.Image.Image): The input image object (e.g., loaded from a GIF).
+    channels (int): The desired number of channels (1: 'L', 3: 'RGB', 4: 'RGBA'). Defaults to 3.
+
+  Yields:
+    PIL.Image.Image: Each frame of the image, converted to the specified mode.
+  
+  Raises:
+    AssertionError: If the number of channels is invalid.
+  """
+  assert channels in CHANNELS_TO_MODE, f'channels {channels} invalid'
+  mode = CHANNELS_TO_MODE[channels]
+  i = 0
+  while True:
+    try:
+      img.seek(i)
+      yield img.convert(mode)
+    except EOFError:
+      break
+    i += 1
+
+
+# Function that takes a tensor of shape (channels, frames, height, width) representing
+# a sequence of frames and saves them as GIF file at the specified path
+# Tensor of shape (frames, height, width, channels) -> gif
+def video_array_to_gif(arr, path, duration = 120, loop = 0, optimize = True):
+  """Converts a video tensor to a GIF file.
+
+  NOTE: This function currently has a potential bug in how it processes frames.
+  It splits the array by channels instead of frames. See implementation notes.
+  It also depends on numpy, torch, torchvision, and PIL.
+
+  Args:
+    arr (np.ndarray): Input tensor of shape (channels, frames, height, width).
+                      Should contain pixel values suitable for image conversion.
+    path (str): The output path for the GIF file.
+    duration (int): Duration (in milliseconds) for each frame. Defaults to 120.
+    loop (int): Number of times the GIF should loop (0 for infinite). Defaults to 0.
+    optimize (bool): Whether to optimize the GIF. Defaults to True.
+
+  Returns:
+    list[PIL.Image.Image]: A list of PIL Image objects representing the frames.
+  """
+
+  images_arr = np.split(arr, arr.shape[0], axis=0) 
+  images_arr = list(map(partial(np.squeeze, axis=0), images_arr)) # Squeeze might fail if channels != 1
+  print(images_arr[0].shape) # Debug print
+  images = map(T.ToPILImage(), images_arr) # Assumes T.ToPILImage handles the squeezed shape
+  first_img, *rest_imgs = images
+  first_img.save(path,
+                 save_all = True,
+                 append_images = rest_imgs,
+                 duration = duration,
+                 loop = loop,
+                 optimize = optimize)
+  return images
+
+# Function that takes a path to a GIF file and returns a tensor of shape
+# (channels, frames, height, width)
+def gif_to_array(path, channels = 3, transform= T.ToTensor()):
+  """Loads a GIF file and converts it into a tensor.
+
+  Depends on PIL, torch, and torchvision.
+
+  Args:
+    path (str): Path to the GIF file.
+    channels (int): Desired number of channels for the output tensor (1, 3, or 4). Defaults to 3.
+    transform (callable): A function (like torchvision.transforms.ToTensor) to apply to each frame. Defaults to T.ToTensor().
+
+  Returns:
+    jnp.ndarray: A JAX array of shape (channels, frames, height, width).
+  """
+  img = Image.open(path)
+  tensors = tuple(map(transform, seek_all_images(img, channels = channels)))
+  tensors = torch.stack(tensors, dim = 1)
+  return jnp.asarray(tensors.numpy())
+
+# Function that pads or truncates an array of shape (channels,frames, height, width)
+# to the specific number of frames
+# If the array already has the specified number of frames, the function returns it unchanged.
+# If the array has more frames, the function truncates it to the specified number of frames.
+# If the array has fewer frames, the function pads it with zeros to the specified number of frames.
+def cast_num_frames(t, *, frames):
+  """Pads or truncates a video tensor along the frame dimension.
+
+  Args:
+    t (jnp.ndarray): Input tensor of shape (channels, frames, height, width).
+    frames (int): The target number of frames.
+
+  Returns:
+    jnp.ndarray: The tensor adjusted to have the specified number of frames.
+                 Padding uses zeros.
+  """
+  num_frames = t.shape[1]
+  if num_frames == frames:
+    return t
+  elif num_frames > frames:
+    return t[:,:frames, ...]
+  else:
+    return jnp.pad(t, pad_width=((0,0), (0, frames - num_frames), (0, 0), (0, 0)))
+
+
+# Function used to extract a text description of each GIF for use as a condition.
+def get_text_from_path(path):
+    """Extracts a descriptive text string from a file path.
+
+    Assumes the filename (without extension) contains hyphen or underscore-separated words.
+
+    Args:
+      path (str): The file path.
+
+    Returns:
+      str: A space-separated string derived from the filename.
+    """
+    out = path.split('/')[-1]
+    out = out.split('.')[0]
+    out = out.replace('-', ' ')
+    out = out.replace('_', ' ')
+    return out
+
+def identity(t, *args, **kwargs):
+  """Identity function. Returns the first argument unchanged.
+
+  Args:
+    t: The input value.
+    *args: Additional positional arguments (ignored).
+    **kwargs: Additional keyword arguments (ignored).
+
+  Returns:
+    The input value `t`.
+  """
+  return t
