@@ -3,6 +3,10 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
+import shutil
+from pathlib import Path
+import orbax.checkpoint as ocp # Import orbax for potential error checking
 # Import all functions being tested
 from utils import (
     exists,
@@ -19,7 +23,9 @@ from utils import (
     num_to_groups,
     cast_num_frames,
     get_text_from_path,
-    identity
+    identity,
+    save_checkpoint,
+    load_checkpoint
 )
 
 # Note: Tests for NNX modules (Upsample, Downsample), file I/O (gif/video functions),
@@ -176,6 +182,94 @@ class TestUtils(unittest.TestCase):
         self.assertIs(identity(b), b)
         self.assertEqual(identity(5), 5)
         self.assertEqual(identity(5, 1, 2, key=3), 5)
+
+
+# --- Mock Model for Testing ---
+
+class MockSimpleNNXModel(nnx.Module):
+    def __init__(self, value: float, *, rngs: nnx.Rngs):
+        self.param = nnx.Param(jnp.array([value]))
+        # Add another type of state for more robust testing
+        self.counter = nnx.Variable(jnp.array(0))
+
+    def increment(self):
+        self.counter.value += 1
+
+# --- Test Class ---
+
+class TestCheckpointUtils(unittest.TestCase):
+
+    def setUp(self):
+        """Set up a temporary directory for checkpoints."""
+        self.test_dir = Path("./test_checkpoint_temp_utils") # Unique name
+        self.test_dir.mkdir(exist_ok=True)
+        # Resolve to an absolute path as required by Orbax
+        self.checkpoint_path = str(self.test_dir.resolve())
+        self.step = 42
+
+        # Initialize a mock model
+        self.key = jax.random.PRNGKey(0)
+        self.model_to_save = MockSimpleNNXModel(value=1.23, rngs=nnx.Rngs(0))
+        self.model_to_save.increment() # Modify state (counter becomes 1)
+
+    def tearDown(self):
+        """Remove the temporary directory."""
+        if self.test_dir.exists():
+            shutil.rmtree(self.test_dir)
+
+    def test_save_checkpoint_creates_files(self):
+        """Test that save_checkpoint creates the expected directory structure."""
+        save_checkpoint(self.model_to_save, self.step, self.checkpoint_path)
+
+        # Check if the Orbax directory structure exists
+        expected_checkpoint_dir = self.test_dir / str(self.step) / "state"
+        self.assertTrue(expected_checkpoint_dir.exists(), f"Checkpoint directory {expected_checkpoint_dir} not found.")
+        # Check if the directory is not empty
+        self.assertTrue(any(expected_checkpoint_dir.iterdir()), f"Checkpoint directory {expected_checkpoint_dir} is empty.")
+
+    def test_load_checkpoint_restores_state(self):
+        """Test that load_checkpoint correctly restores the model's state."""
+        # 1. Save the initial model
+        save_checkpoint(self.model_to_save, self.step, self.checkpoint_path)
+
+        # 2. Create a new model instance with a different initial state
+        model_to_load = MockSimpleNNXModel(value=9.99, rngs=nnx.Rngs(1)) # Different value and rngs
+        self.assertEqual(model_to_load.counter.value, 0) # Counter starts at 0
+
+        # 3. Load the checkpoint into the new model
+        loaded_model = load_checkpoint(model_to_load, self.step, self.checkpoint_path)
+
+        # 4. Verify the state is restored
+        self.assertIsInstance(loaded_model, MockSimpleNNXModel)
+
+        # Split both models to compare states
+        _, state_original = nnx.split(self.model_to_save)
+        _, state_loaded = nnx.split(loaded_model)
+
+        # Compare parameter values (should be ~1.23)
+        np.testing.assert_allclose(
+            state_loaded['param'].value,
+            state_original['param'].value,
+            rtol=1e-6,
+            err_msg="Loaded parameter value does not match saved value."
+        )
+        # Compare other variable values (counter should be 1)
+        np.testing.assert_array_equal(
+            state_loaded['counter'].value,
+            state_original['counter'].value,
+            err_msg="Loaded variable (counter) value does not match saved value."
+        )
+        # Also check the counter value directly on the loaded model object
+        self.assertEqual(loaded_model.counter.value, 1, "Counter value on loaded model object is incorrect.")
+
+    def test_load_nonexistent_checkpoint_raises_error(self):
+        """Test that loading a non-existent step raises an error."""
+        model_to_load = MockSimpleNNXModel(value=0.0, rngs=nnx.Rngs(0))
+        non_existent_step = 999
+        # Orbax checkpointer.restore() should raise an error if the path doesn't exist
+        # Catching a more specific error if possible, but Exception is safer across versions
+        with self.assertRaises((FileNotFoundError, Exception), msg="Loading non-existent checkpoint did not raise an error."):
+            load_checkpoint(model_to_load, non_existent_step, self.checkpoint_path)
 
 
 if __name__ == '__main__':

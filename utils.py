@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torchvision import transforms as T
 from functools import partial
+import orbax.checkpoint as ocp
 
 
 CHANNELS_TO_MODE = {
@@ -372,3 +373,59 @@ def identity(t, *args, **kwargs):
     The input value `t`.
   """
   return t
+
+
+def save_checkpoint(model: nnx.Module, step: int, path: str):
+    """Saves the state of an NNX model using Orbax CheckpointManager.
+
+    Args:
+        model: The Flax NNX model instance to save.
+        step (int): The current training step, used to name the checkpoint directory.
+        path (str): The base directory path where the checkpoint subdirectory
+                    (e.g., '{path}/{step}/state') will be created.
+    """
+    # Get the model state dictionary
+    _, state = nnx.split(model)
+
+    # Create an Orbax checkpointer
+    checkpointer = ocp.StandardCheckpointer()
+
+
+    # Save the checkpoint
+    checkpointer.save(
+        f"{path}/{step}/state",
+        state,
+        force=True
+    )
+    checkpointer.wait_until_finished()
+
+    print(f"Checkpoint saved at step {step} to {path}")
+
+def load_checkpoint(model: nnx.Module, step: int, path: str) -> nnx.Module:
+    """Loads the state of an NNX model from an Orbax checkpoint.
+
+    Note: This function modifies the input model object by merging the loaded state.
+    However, due to how NNX works, it's recommended to use the returned model object.
+
+    Args:
+        model: The Flax NNX model instance with the correct structure but potentially
+               uninitialized or incorrect parameters.
+        step (int): The training step of the checkpoint to load.
+        path (str): The base directory path containing the checkpoint subdirectory
+                    (e.g., '{path}/{step}/state').
+
+    Returns:
+        The NNX model instance with the loaded state merged into it.
+    """
+    # Create an Orbax checkpointer
+    checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+
+    graphdef, abstract_state = nnx.split(model)
+    # Load the checkpoint
+    state_restored = checkpointer.restore(f'{path}/{step}/state/', abstract_state)
+
+
+    # Apply the state dictionary to the model
+    model = nnx.merge(graphdef, state_restored)
+    print(f"Checkpoint loaded from step: {step}")
+    return model
