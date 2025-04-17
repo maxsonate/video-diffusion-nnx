@@ -35,4 +35,5 @@ trainer:
   checkpoint_every_steps: 10
   checkpoint_dir_path: ""
   add_loss_plot: false
-  resume_training_step: 0 
+  resume_training_step: 0
+  tensorboard_dir: "./results/tensorboard" 

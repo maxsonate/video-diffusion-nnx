@@ -66,6 +66,7 @@ trainer = Trainer(
     checkpoint_dir_path=trainer_cfg['checkpoint_dir_path'],
     add_loss_plot=trainer_cfg['add_loss_plot'],
     resume_training_step=trainer_cfg['resume_training_step'],
+    tensorboard_dir=trainer_cfg['tensorboard_dir'],
 )
 
 # TODO: Add loading from checkpoint

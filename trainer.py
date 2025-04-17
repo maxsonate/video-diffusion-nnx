@@ -8,6 +8,7 @@ from pathlib import Path
 import torch.utils.data as data
 from itertools import cycle
 from einops import rearrange
+from torch.utils.tensorboard import SummaryWriter
 
 
 # Assuming utils.py contains these functions
@@ -52,6 +53,7 @@ class Trainer:
         checkpoint_every_steps (int, optional): Frequency (in steps) for saving model checkpoints. Defaults to 10.
         checkpoint_dir_path (str, optional): Directory path to save model checkpoints. If empty, defaults to '{results_folder}/checkpoints'. Defaults to ''.
         add_loss_plot (bool, optional): Whether to display a live loss plot (requires plotly/IPython). Defaults to False. (Note: Plotting logic removed).
+        tensorboard_dir (str, optional): Directory to save TensorBoard logs. Defaults to ''.
         resume_training_step (int, optional): Step number to resume training from (requires checkpoint loading). Defaults to 0.
     """
     def __init__(
@@ -77,6 +79,7 @@ class Trainer:
         checkpoint_every_steps: int = 10,
         checkpoint_dir_path: str = '',
         add_loss_plot: bool = False, # Kept for potential future use
+        tensorboard_dir: str = '',
         resume_training_step: int = 0
       ):
         """Initializes the Trainer instance."""
@@ -129,6 +132,12 @@ class Trainer:
                                   else (self.results_folder / 'checkpoints').resolve())
         self.checkpoint_dir_path.mkdir(exist_ok=True, parents=True)
         self.checkpoint_every_steps = checkpoint_every_steps
+
+        # --- TensorBoard Setup ---
+        self.tensorboard_dir = Path(tensorboard_dir).resolve() if tensorboard_dir else self.results_folder / 'tensorboard'
+        self.tensorboard_dir.mkdir(exist_ok=True, parents=True)
+        self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
+        print(f"TensorBoard logs will be saved to: {self.tensorboard_dir}")
 
         # --- State ---
         self.step = resume_training_step
@@ -241,6 +250,10 @@ class Trainer:
             print(f"Step: {self.step}/{self.train_num_steps} | Loss: {current_loss:.4f}", flush=True)
             log_fn({'loss': current_loss, 'step': self.step})
 
+            # --- TensorBoard Logging ---
+            self.writer.add_scalar('loss/train', current_loss, self.step)
+            
+
             # --- EMA Update (TBD) ---
             # if self.step >= self.step_start_ema and self.step % self.update_ema_every == 0:
             #     # self.ema.step_ema() # TODO: Implement EMA update
@@ -272,6 +285,11 @@ class Trainer:
             # TODO: Save final optimizer state
         except Exception as e:
             print(f"Error saving final checkpoint at step {self.step}: {e}")
+
+        # Close TensorBoard writer
+        self.writer.close()
+        print(f"TensorBoard logs saved to: {self.tensorboard_dir}")
+        print(f"View TensorBoard with: tensorboard --logdir={self.tensorboard_dir}")
 
     # --- Sampling Method (Removed - Placeholder left above) ---
     # def generate_samples(self, milestone: int):
