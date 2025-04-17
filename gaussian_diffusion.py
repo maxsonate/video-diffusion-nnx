@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from functools import partial
 from tqdm import tqdm
 from einops import rearrange
 from einops_exts import check_shape

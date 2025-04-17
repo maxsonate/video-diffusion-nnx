@@ -6,7 +6,7 @@ from flax import nnx
 from unittest.mock import patch, MagicMock
 
 # Import the class to test
-from guassian_diffusion import GaussianDiffusion
+from gaussian_diffusion import GaussianDiffusion
 
 # Mock the utility functions that might not be available or have complex dependencies
 # If these are simple and available in utils.py, this mocking might not be needed
@@ -49,11 +49,11 @@ class TestGaussianDiffusion(unittest.TestCase):
 
         # Instantiate the class under test
         # Patching tqdm to prevent progress bar printing during tests
-        with patch('guassian_diffusion.tqdm', lambda x, **kwargs: x): # Simple patch for tqdm
+        with patch('gaussian_diffusion.tqdm', lambda x, **kwargs: x): # Simple patch for tqdm
              # Patching the external utility functions directly in the target module's namespace
-             with patch('guassian_diffusion.bert_embed', mock_bert_embed), \
-                  patch('guassian_diffusion.tokenize', mock_tokenize), \
-                  patch('guassian_diffusion.check_shape', mock_check_shape):
+             with patch('gaussian_diffusion.bert_embed', mock_bert_embed), \
+                  patch('gaussian_diffusion.tokenize', mock_tokenize), \
+                  patch('gaussian_diffusion.check_shape', mock_check_shape):
                 
                 self.diffusion = GaussianDiffusion(
                     denoise_fn=mock_unet,
@@ -225,16 +225,16 @@ class TestGaussianDiffusion(unittest.TestCase):
         """Test the output shape of the sampling loop."""
         shape = (1, self.channels, self.num_frames, self.image_size, self.image_size)
         # Patching tqdm to avoid printing
-        with patch('guassian_diffusion.tqdm', lambda x, **kwargs: x):
+        with patch('gaussian_diffusion.tqdm', lambda x, **kwargs: x):
              sample = self.diffusion.p_sample_loop(shape)
         self.assertEqual(sample.shape, shape)
 
     def test_sample_shape(self):
         """Test the main sample method output shape."""
         # Patching tqdm and text utils
-        with patch('guassian_diffusion.tqdm', lambda x, **kwargs: x), \
-             patch('guassian_diffusion.bert_embed', mock_bert_embed), \
-             patch('guassian_diffusion.tokenize', mock_tokenize):
+        with patch('gaussian_diffusion.tqdm', lambda x, **kwargs: x), \
+             patch('gaussian_diffusion.bert_embed', mock_bert_embed), \
+             patch('gaussian_diffusion.tokenize', mock_tokenize):
             
             # Test without condition
             samples_no_cond = self.diffusion.sample(batch_size=self.batch_size)
@@ -250,7 +250,7 @@ class TestGaussianDiffusion(unittest.TestCase):
         """Test the output shape of interpolation."""
         x1 = jnp.zeros_like(self.x_start)
         x2 = jnp.ones_like(self.x_start)
-        with patch('guassian_diffusion.tqdm', lambda x, **kwargs: x):
+        with patch('gaussian_diffusion.tqdm', lambda x, **kwargs: x):
             interpolated = self.diffusion.interpolate(x1, x2, lam=0.5)
         self.assertEqual(interpolated.shape, self.x_start.shape)
 

@@ -1,6 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
+import logging
 import optax
 from flax import nnx
 from pathlib import Path
@@ -119,9 +120,13 @@ class Trainer:
         self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True, pin_memory=True))
 
         # --- Results and Checkpointing ---
-        self.results_folder = Path(results_folder)
+        # Resolve results_folder to an absolute path
+        self.results_folder = Path(results_folder).resolve()
         self.results_folder.mkdir(exist_ok=True, parents=True)
-        self.checkpoint_dir_path = Path(checkpoint_dir_path) if checkpoint_dir_path else self.results_folder / 'checkpoints'
+        # Resolve checkpoint_dir_path to ensure it's absolute
+        self.checkpoint_dir_path = (Path(checkpoint_dir_path).resolve()
+                                  if checkpoint_dir_path
+                                  else (self.results_folder / 'checkpoints').resolve())
         self.checkpoint_dir_path.mkdir(exist_ok=True, parents=True)
         self.checkpoint_every_steps = checkpoint_every_steps
 
@@ -211,7 +216,7 @@ class Trainer:
             if jnp.issubdtype(batch_data.dtype, jnp.integer):
                 batch_data = batch_data.astype(jnp.float32) / 255.0
             elif jnp.max(batch_data) > 1.0:
-                 print(f"Warning: Input data max is {jnp.max(batch_data)}. Performing simple max normalization.", flush=True)
+                 # logging.warning(f"Input data max is {jnp.max(batch_data)}. Performing simple max normalization.")
                  batch_data = batch_data / jnp.max(batch_data)
 
             # --- Gradient Calculation and Optimization ---
