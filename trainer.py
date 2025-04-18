@@ -55,6 +55,7 @@ class Trainer:
         add_loss_plot (bool, optional): Whether to display a live loss plot (requires plotly/IPython). Defaults to False. (Note: Plotting logic removed).
         tensorboard_dir (str, optional): Directory to save TensorBoard logs. Defaults to ''.
         resume_training_step (int, optional): Step number to resume training from (requires checkpoint loading). Defaults to 0.
+        ema_decay (float, optional): Decay rate for EMA. Defaults to 0.9999.
     """
     def __init__(
         self,
@@ -80,10 +81,19 @@ class Trainer:
         checkpoint_dir_path: str = '',
         add_loss_plot: bool = False, # Kept for potential future use
         tensorboard_dir: str = '',
-        resume_training_step: int = 0
+        resume_training_step: int = 0,
+        ema_decay: float = 0.9999
       ):
         """Initializes the Trainer instance."""
         super().__init__()
+
+        # EMA Configuration
+        self.step_start_ema = step_start_ema
+        self.update_ema_every = update_ema_every
+        self.ema_decay = ema_decay
+        # Initialize EMA parameters as a copy of the model's initial parameters
+        _, init_params = nnx.split(diffusion_model)
+        self.ema_params = init_params
 
         # --- Core Components ---
         self.model = diffusion_model
@@ -95,17 +105,6 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.use_path_as_cond = use_path_as_cond
         self.gradient_accumulate_every = gradient_accumulate_every # TODO: Implement gradient accumulation
-
-        # --- EMA Configuration (Not Implemented) ---
-        self.step_start_ema = step_start_ema
-        self.update_ema_every = update_ema_every
-        # self.ema = EMA(self.model, ema_decay) # TODO: Implement EMA
-
-        # --- Sampling Configuration (Not Implemented) ---
-        self.save_and_sample_every = save_and_sample_every
-        self.num_sample_rows = num_sample_rows
-        self.sample_text = sample_text
-        self.cond_scale = cond_scale
 
         # --- Dataset and Dataloader ---
         self.image_size = diffusion_model.image_size
@@ -254,10 +253,16 @@ class Trainer:
             self.writer.add_scalar('loss/train', current_loss, self.step)
             
 
-            # --- EMA Update (TBD) ---
-            # if self.step >= self.step_start_ema and self.step % self.update_ema_every == 0:
-            #     # self.ema.step_ema() # TODO: Implement EMA update
-            #     print(f"Step: {self.step} | Updated EMA model")
+            # --- EMA Update ---
+            if self.step >= self.step_start_ema and self.step % self.update_ema_every == 0:
+                # Extract current model parameters
+                _, curr_params = nnx.split(self.model)
+                # Update EMA parameters
+                self.ema_params = jax.tree_map(
+                    lambda ema_p, p: self.ema_decay * ema_p + (1 - self.ema_decay) * p,
+                    self.ema_params, curr_params
+                )
+                print(f"Step: {self.step} | Updated EMA parameters")
 
             # --- Checkpointing ---
             if self.step > 0 and self.step % self.checkpoint_every_steps == 0:
