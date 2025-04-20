@@ -1,0 +1,13 @@
+jax
+flax
+optax
+orbax-checkpoint
+numpy
+torch
+torchvision
+einops
+einops-exts # Used in gaussian_diffusion.py
+PyYAML
+tqdm
+Pillow # For PIL
+pytest # For running tests 
