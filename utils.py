@@ -8,6 +8,8 @@ import torch
 from torchvision import transforms as T
 from functools import partial
 import orbax.checkpoint as ocp
+from orbax.checkpoint import CheckpointManager, args as ocp_args
+import logging
 
 
 CHANNELS_TO_MODE = {
@@ -135,10 +137,10 @@ def clip_grad_norm(grads, max_grad_norm, epsilon=1e-6):
   total_leaves = len(jax.tree.leaves(grad_squared))
 
   l2_norm = l2_norm / total_leaves
-  print(f'l2 norm:{l2_norm}')
+  # logging.info(f'l2 norm:{l2_norm}') # Keep as comment or remove if not needed for debug
 
   scale = jnp.minimum(max_grad_norm / l2_norm, 1.0)
-  print(f'clip scale:{scale}')
+  # logging.info(f'clip scale:{scale}') # Keep as comment or remove if not needed for debug
   return jax.tree.map(lambda x: x * scale, grads)
 
 grads_test = {
@@ -287,7 +289,7 @@ def video_array_to_gif(arr, path, duration = 120, loop = 0, optimize = True):
 
   images_arr = np.split(arr, arr.shape[0], axis=0) 
   images_arr = list(map(partial(np.squeeze, axis=0), images_arr)) # Squeeze might fail if channels != 1
-  print(images_arr[0].shape) # Debug print
+  # logging.info(images_arr[0].shape, len(images_arr)) # Keep as comment or remove if not needed for debug
   images = map(T.ToPILImage(), images_arr) # Assumes T.ToPILImage handles the squeezed shape
   first_img, *rest_imgs = images
   first_img.save(path,
@@ -375,33 +377,29 @@ def identity(t, *args, **kwargs):
   return t
 
 
-def save_checkpoint(model: nnx.Module, step: int, path: str):
+def save_checkpoint(ckpt_manager: CheckpointManager, model: nnx.Module, step: int):
     """Saves the state of an NNX model using Orbax CheckpointManager.
 
     Args:
+        ckpt_manager: The Orbax CheckpointManager instance to use.
         model: The Flax NNX model instance to save.
-        step (int): The current training step, used to name the checkpoint directory.
-        path (str): The base directory path where the checkpoint subdirectory
-                    (e.g., '{path}/{step}/state') will be created.
+        step (int): The current training step, used as the checkpoint identifier.
     """
-    # Get the model state dictionary
+    # Get the model state dictionar
     _, state = nnx.split(model)
-
-    # Create an Orbax checkpointer
-    checkpointer = ocp.StandardCheckpointer()
 
 
     # Save the checkpoint
-    checkpointer.save(
-        f"{path}/{step}/state",
-        state,
-        force=True
+    ckpt_manager.save(
+        step,
+        args=ocp_args.StandardSave(state), # Use StandardSave args
+        force=True # Allow overwriting if step already exists (optional)
     )
-    checkpointer.wait_until_finished()
+    ckpt_manager.wait_until_finished()
 
-    print(f"Checkpoint saved at step {step} to {path}")
+    logging.info(f"Checkpoint saved at step {step}")
 
-def load_checkpoint(model: nnx.Module, step: int, path: str) -> nnx.Module:
+def load_checkpoint(model: nnx.Module, step: int, path: str, ckpt_manager: CheckpointManager | None = None) -> nnx.Module:
     """Loads the state of an NNX model from an Orbax checkpoint.
 
     Note: This function modifies the input model object by merging the loaded state.
@@ -413,19 +411,25 @@ def load_checkpoint(model: nnx.Module, step: int, path: str) -> nnx.Module:
         step (int): The training step of the checkpoint to load.
         path (str): The base directory path containing the checkpoint subdirectory
                     (e.g., '{path}/{step}/state').
+        ckpt_manager (CheckpointManager | None, optional): The Orbax CheckpointManager instance
+                                                          to use for loading the checkpoint.
+                                                          If None, a new Checkpointer will be created.
+                                                          Defaults to None.
 
     Returns:
         The NNX model instance with the loaded state merged into it.
     """
     # Create an Orbax checkpointer
-    checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+    if ckpt_manager is None:
+        ckpt_manager = ocp.CheckpointManager(path, options=ocp.CheckpointManagerOptions())
+    #checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
 
     graphdef, abstract_state = nnx.split(model)
     # Load the checkpoint
-    state_restored = checkpointer.restore(f'{path}/{step}/state/', abstract_state)
+    state_restored = ckpt_manager.restore(step, args=ocp_args.StandardRestore(abstract_state))
 
 
     # Apply the state dictionary to the model
     model = nnx.merge(graphdef, state_restored)
-    print(f"Checkpoint loaded from step: {step}")
+    logging.info(f"Checkpoint loaded from step: {step}")
     return model

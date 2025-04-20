@@ -20,6 +20,12 @@ def main():
         default=str(Path(__file__).parent / 'configs' / 'config.yaml'),
         help='Path to the YAML config file'
     )
+    parser.add_argument(
+        '--resume_step',
+        type=int,
+        default=None,
+        help='Step to resume training from'
+    )
     args = parser.parse_args()
     config_path = Path(args.config)
 
@@ -76,8 +82,9 @@ def main():
         checkpoint_every_steps=trainer_cfg['checkpoint_every_steps'],
         checkpoint_dir_path=trainer_cfg['checkpoint_dir_path'],
         add_loss_plot=trainer_cfg['add_loss_plot'],
-        resume_training_step=trainer_cfg['resume_training_step'],
+        resume_training_step=args.resume_step,
         tensorboard_dir=trainer_cfg['tensorboard_dir'],
+        max_to_keep=trainer_cfg.get('max_to_keep', None)
     )
 
     # TODO: Add loading from checkpoint before starting training

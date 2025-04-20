@@ -17,10 +17,13 @@ from utils import (
     num_to_groups, # Only needed if sampling is enabled
     noop,
     save_checkpoint,
+    load_checkpoint,
     clip_grad_norm,
     # cycle # Imported from itertools
 )
-# Assuming datasets.py contains MovingMNIST
+import orbax.checkpoint as ocp
+from orbax.checkpoint import CheckpointManager, CheckpointManagerOptions, args as ocp_args
+from typing import Optional
 from datasets import MovingMNIST
 
 # TODO: Add EMA import and functionality
@@ -56,6 +59,7 @@ class Trainer:
         tensorboard_dir (str, optional): Directory to save TensorBoard logs. Defaults to ''.
         resume_training_step (int, optional): Step number to resume training from (requires checkpoint loading). Defaults to 0.
         ema_decay (float, optional): Decay rate for EMA. Defaults to 0.9999.
+        max_to_keep (int | None, optional): Maximum number of checkpoints to keep. If None, all checkpoints are kept. Defaults to None.
     """
     def __init__(
         self,
@@ -82,8 +86,9 @@ class Trainer:
         add_loss_plot: bool = False, # Kept for potential future use
         tensorboard_dir: str = '',
         resume_training_step: int = 0,
-        ema_decay: float = 0.9999
-      ):
+        ema_decay: float = 0.9999,
+        max_to_keep: int | None = None,
+    ):
         """Initializes the Trainer instance."""
         super().__init__()
 
@@ -131,6 +136,10 @@ class Trainer:
                                   else (self.results_folder / 'checkpoints').resolve())
         self.checkpoint_dir_path.mkdir(exist_ok=True, parents=True)
         self.checkpoint_every_steps = checkpoint_every_steps
+        # --- Orbax Checkpoint Manager ---
+        options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
+        self.ckpt_manager = CheckpointManager(self.checkpoint_dir_path, options=options)
+        print(f"Checkpoint manager initialized at {self.checkpoint_dir_path} with max_to_keep={max_to_keep}")
 
         # --- TensorBoard Setup ---
         self.tensorboard_dir = Path(tensorboard_dir).resolve() if tensorboard_dir else self.results_folder / 'tensorboard'
@@ -143,13 +152,13 @@ class Trainer:
         if self.step > 0:
             print(f"Attempting to resume training from step {self.step}")
             # TODO: Implement checkpoint loading using load_checkpoint utility
-            # try:
-            #     self.model = load_checkpoint(self.model, self.step, self.checkpoint_dir_path)
-            #     # TODO: Load optimizer state as well
-            #     print(f"Successfully loaded checkpoint from step {self.step}")
-            # except FileNotFoundError:
-            #     print(f"Warning: Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}. Starting from step 0.")
-            #     self.step = 0
+            try:
+                self.model = load_checkpoint(self.model, self.step, self.checkpoint_dir_path, ckpt_manager=self.ckpt_manager)
+                # TODO: Load optimizer state as well
+                print(f"Successfully loaded checkpoint from step {self.step}")
+            except FileNotFoundError:
+                print(f"Warning: Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}. Starting from step 0.")
+                self.step = 0
 
         # --- Visualization (Not Implemented) ---
         self.add_loss_plot = add_loss_plot
@@ -251,6 +260,7 @@ class Trainer:
 
             # --- TensorBoard Logging ---
             self.writer.add_scalar('loss/train', current_loss, self.step)
+
             
 
             # --- EMA Update ---
@@ -268,7 +278,7 @@ class Trainer:
             if self.step > 0 and self.step % self.checkpoint_every_steps == 0:
                 print(f"Step: {self.step} | Saving checkpoint...", flush=True)
                 try:
-                    save_checkpoint(self.model, self.step, self.checkpoint_dir_path)
+                    save_checkpoint(self.ckpt_manager, self.model, self.step)
                     # TODO: Save optimizer state as well
                 except Exception as e:
                     print(f"Error saving checkpoint at step {self.step}: {e}")

@@ -37,3 +37,4 @@ trainer:
   add_loss_plot: false
   resume_training_step: 0
   tensorboard_dir: "./results/tensorboard" 
+  max_to_keep: 100
