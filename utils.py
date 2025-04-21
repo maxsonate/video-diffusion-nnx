@@ -10,6 +10,9 @@ from functools import partial
 import orbax.checkpoint as ocp
 from orbax.checkpoint import CheckpointManager, args as ocp_args
 import logging
+from typing import Any
+# PyTree is a JAX pytree (arbitrary nested structure), use Any for compatibility
+PyTree = Any
 
 
 CHANNELS_TO_MODE = {
@@ -377,29 +380,35 @@ def identity(t, *args, **kwargs):
   return t
 
 
-def save_checkpoint(ckpt_manager: CheckpointManager, model: nnx.Module, step: int):
+def save_checkpoint(ckpt_manager: CheckpointManager, model: nnx.Module, ema_params: PyTree, step: int):
     """Saves the state of an NNX model using Orbax CheckpointManager.
 
     Args:
         ckpt_manager: The Orbax CheckpointManager instance to use.
         model: The Flax NNX model instance to save.
+        ema_params: The Flax NNX model instance to save.
         step (int): The current training step, used as the checkpoint identifier.
     """
     # Get the model state dictionar
     _, state = nnx.split(model)
 
+    # Combine states into one PyTree dict
+    save_items = {
+        'model': state,
+        'ema_params': ema_params,
+    }
 
-    # Save the checkpoint
+    # Save the checkpoint as a single unnamed PyTree
     ckpt_manager.save(
         step,
-        args=ocp_args.StandardSave(state), # Use StandardSave args
-        force=True # Allow overwriting if step already exists (optional)
+        args=ocp_args.StandardSave(save_items),  # Save combined PyTree dict
+        force=True  # Allow overwriting if step already exists
     )
     ckpt_manager.wait_until_finished()
 
     logging.info(f"Checkpoint saved at step {step}")
 
-def load_checkpoint(model: nnx.Module, step: int, path: str, ckpt_manager: CheckpointManager | None = None) -> nnx.Module:
+def load_checkpoint(model: nnx.Module, step: int, path: str, ckpt_manager: CheckpointManager | None = None, load_ema_params: bool = False) -> nnx.Module:
     """Loads the state of an NNX model from an Orbax checkpoint.
 
     Note: This function modifies the input model object by merging the loaded state.
@@ -415,7 +424,7 @@ def load_checkpoint(model: nnx.Module, step: int, path: str, ckpt_manager: Check
                                                           to use for loading the checkpoint.
                                                           If None, a new Checkpointer will be created.
                                                           Defaults to None.
-
+        load_ema_params (bool, optional): Whether to load EMA parameters. Defaults to False.
     Returns:
         The NNX model instance with the loaded state merged into it.
     """
@@ -424,12 +433,27 @@ def load_checkpoint(model: nnx.Module, step: int, path: str, ckpt_manager: Check
         ckpt_manager = ocp.CheckpointManager(path, options=ocp.CheckpointManagerOptions())
     #checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
 
+    # Split out the abstract model state
     graphdef, abstract_state = nnx.split(model)
-    # Load the checkpoint
-    state_restored = ckpt_manager.restore(step, args=ocp_args.StandardRestore(abstract_state))
-
+    # Create an abstract template for both model and EMA (same shape)
+    abstract = {
+        'model': abstract_state,
+        'ema_params': abstract_state
+    }
+    # Restore the combined dict of model and EMA states
+    state_dict = ckpt_manager.restore(
+        step,
+        args=ocp_args.StandardRestore(abstract)
+    )
+    model_params = state_dict['model']
+    ema_params = state_dict['ema_params']
 
     # Apply the state dictionary to the model
-    model = nnx.merge(graphdef, state_restored)
+    if load_ema_params:
+        model = nnx.merge(graphdef, ema_params)
+        logging.info("Loaded EMA parameters")
+    else:
+        model = nnx.merge(graphdef, model_params)
+        logging.info("Loaded model parameters")
     logging.info(f"Checkpoint loaded from step: {step}")
-    return model
+    return model, ema_params

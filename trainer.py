@@ -153,7 +153,8 @@ class Trainer:
             print(f"Attempting to resume training from step {self.step}")
             # TODO: Implement checkpoint loading using load_checkpoint utility
             try:
-                self.model = load_checkpoint(self.model, self.step, self.checkpoint_dir_path, ckpt_manager=self.ckpt_manager)
+                self.model, self.ema_params = load_checkpoint(self.model, self.step, self.checkpoint_dir_path, ckpt_manager=self.ckpt_manager, load_ema_params=False)
+
                 # TODO: Load optimizer state as well
                 print(f"Successfully loaded checkpoint from step {self.step}")
             except FileNotFoundError:
@@ -278,7 +279,7 @@ class Trainer:
             if self.step > 0 and self.step % self.checkpoint_every_steps == 0:
                 print(f"Step: {self.step} | Saving checkpoint...", flush=True)
                 try:
-                    save_checkpoint(self.ckpt_manager, self.model, self.step)
+                    save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.step)
                     # TODO: Save optimizer state as well
                 except Exception as e:
                     print(f"Error saving checkpoint at step {self.step}: {e}")
@@ -296,7 +297,7 @@ class Trainer:
         # Save final checkpoint
         print("Saving final checkpoint...", flush=True)
         try:
-            save_checkpoint(self.model, self.step, self.checkpoint_dir_path)
+            save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.optimizer.opt_state, self.step)
             # TODO: Save final optimizer state
         except Exception as e:
             print(f"Error saving final checkpoint at step {self.step}: {e}")

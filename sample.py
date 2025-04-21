@@ -40,6 +40,13 @@ def main():
         default=0,
         help='Checkpoint step number to load'
     )
+    parser.add_argument(
+        '--load-ema-params',
+        type=bool,
+        default=False,
+        help='Whether to load EMA parameters'
+    )
+
     args = parser.parse_args()
     config_path = Path(args.config)
     output_path = Path(args.output_path)
@@ -73,7 +80,7 @@ def main():
     )
 
     checkpoint_path = Path(args.checkpoint_path).resolve()
-    diffusion_model = load_checkpoint(diffusion_model, args.step, str(checkpoint_path))
+    diffusion_model, _ = load_checkpoint(diffusion_model, args.step, str(checkpoint_path), load_ema_params=args.load_ema_params)
     logging.info(f"Loaded checkpoint from {checkpoint_path} at step {args.step}")
 
     sampled_videos = diffusion_model.sample()
