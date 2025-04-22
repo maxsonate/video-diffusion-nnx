@@ -84,7 +84,10 @@ def main():
         add_loss_plot=trainer_cfg['add_loss_plot'],
         resume_training_step=args.resume_step,
         tensorboard_dir=trainer_cfg['tensorboard_dir'],
-        max_to_keep=trainer_cfg.get('max_to_keep', None)
+        max_to_keep=trainer_cfg.get('max_to_keep', None),
+        lr_decay_start_step=trainer_cfg['lr_decay_start_step'],
+        lr_decay_steps=trainer_cfg['lr_decay_steps'],
+        lr_decay_coeff=trainer_cfg['lr_decay_coeff'],
     )
 
     # TODO: Add loading from checkpoint before starting training

@@ -60,6 +60,9 @@ class Trainer:
         resume_training_step (int, optional): Step number to resume training from (requires checkpoint loading). Defaults to 0.
         ema_decay (float, optional): Decay rate for EMA. Defaults to 0.9999.
         max_to_keep (int | None, optional): Maximum number of checkpoints to keep. If None, all checkpoints are kept. Defaults to None.
+        lr_decay_start_step (int, optional): Step number to start learning rate decay. Defaults to 0.
+        lr_decay_steps (int, optional): Number of steps over which to decay learning rate. Defaults to 0.
+        lr_decay_coeff (float, optional): Coefficient for learning rate decay. Defaults to 0.1.
     """
     def __init__(
         self,
@@ -88,6 +91,9 @@ class Trainer:
         resume_training_step: int = 0,
         ema_decay: float = 0.9999,
         max_to_keep: int | None = None,
+        lr_decay_start_step: int = 0,
+        lr_decay_steps: int = 0,
+        lr_decay_coeff: float = 1.0,
     ):
         """Initializes the Trainer instance."""
         super().__init__()
@@ -102,7 +108,20 @@ class Trainer:
 
         # --- Core Components ---
         self.model = diffusion_model
-        self.optimizer = nnx.Optimizer(self.model, optax.adam(train_lr))
+
+        self.lr_schedule = optax.piecewise_interpolate_schedule(
+            interpolate_type='cosine',
+            init_value=train_lr,
+            boundaries_and_scales={
+                lr_decay_start_step:                    1.0,             # hold at init_value until you hit decay
+                lr_decay_start_step + lr_decay_steps:  lr_decay_coeff  # then cosine‐interpolate down to init*coeff
+            }
+        )
+        self.optimizer = nnx.Optimizer(
+            self.model,
+            optax.adam(self.lr_schedule)    # ← pass the function, not schedule(self.step)
+        )
+        
 
         # --- Training Configuration ---
         self.train_num_steps = train_num_steps
@@ -261,6 +280,7 @@ class Trainer:
 
             # --- TensorBoard Logging ---
             self.writer.add_scalar('loss/train', current_loss, self.step)
+            self.writer.add_scalar('lr/train', self.lr_schedule(self.step), self.step)
 
             
 
