@@ -23,8 +23,14 @@ def main():
     parser.add_argument(
         '--resume_step',
         type=int,
-        default=None,
+        default=0,
         help='Step to resume training from'
+    )
+    parser.add_argument(
+        '--rng_seed',
+        type=int,
+        default=None,
+        help='RNG seed to use for training'
     )
     args = parser.parse_args()
     config_path = Path(args.config)
@@ -33,6 +39,11 @@ def main():
     print(f"Loading configuration from: {config_path}")
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # --- RNG Seed ---
+    # Use command-line seed if provided, otherwise use config seed, otherwise default to 0
+    master_seed = args.rng_seed if args.rng_seed is not None else config.get('rng_seed', 0)
+    print(f"Using master RNG seed: {master_seed}")
 
     # Instantiate Unet3D from config
     unet_cfg = config['unet']
@@ -88,6 +99,7 @@ def main():
         lr_decay_start_step=trainer_cfg['lr_decay_start_step'],
         lr_decay_steps=trainer_cfg['lr_decay_steps'],
         lr_decay_coeff=trainer_cfg['lr_decay_coeff'],
+        rng_seed=master_seed,
     )
 
     # TODO: Add loading from checkpoint before starting training

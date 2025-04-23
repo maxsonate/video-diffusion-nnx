@@ -11,6 +11,7 @@ import orbax.checkpoint as ocp
 from orbax.checkpoint import CheckpointManager, args as ocp_args
 import logging
 from typing import Any
+from jax import tree_util
 # PyTree is a JAX pytree (arbitrary nested structure), use Any for compatibility
 PyTree = Any
 
@@ -131,20 +132,24 @@ def clip_grad_norm(grads, max_grad_norm, epsilon=1e-6):
       grads: Pytree of gradients
       max_grad_norm: Maximum allowed gradient norm
       epsilon: Small value to prevent division by zero
+      l2_norm: L2 norm of the pre clipped gradients
 
   Returns:
       Normalized gradients
   """
-  grad_squared = jax.tree.map(lambda x: jnp.sum(x**2), grads)
-  l2_norm = jnp.sqrt(jax.tree.reduce(jnp.add, grad_squared) + epsilon)
-  total_leaves = len(jax.tree.leaves(grad_squared))
+  # Compute squared L2 norm per leaf
+  grad_squared = tree_util.tree_map(lambda x: jnp.sum(x**2), grads)
+  # Sum over all leaves to get total squared norm
+  total_sq = tree_util.tree_reduce(jnp.add, grad_squared, 0.0)
+  # Global L2 norm
+  l2_norm = jnp.sqrt(total_sq + epsilon)
 
-  l2_norm = l2_norm / total_leaves
   # logging.info(f'l2 norm:{l2_norm}') # Keep as comment or remove if not needed for debug
 
-  scale = jnp.minimum(max_grad_norm / l2_norm, 1.0)
+  # Compute clipping scale; ensure norm does not exceed max_grad_norm
+  scale = jnp.minimum(max_grad_norm / (l2_norm + epsilon), 1.0)
   # logging.info(f'clip scale:{scale}') # Keep as comment or remove if not needed for debug
-  return jax.tree.map(lambda x: x * scale, grads)
+  return tree_util.tree_map(lambda x: x * scale, grads), l2_norm
 
 grads_test = {
         'weights': jnp.array([1, 2, 3]),

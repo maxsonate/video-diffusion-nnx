@@ -63,12 +63,14 @@ class Trainer:
         lr_decay_start_step (int, optional): Step number to start learning rate decay. Defaults to 0.
         lr_decay_steps (int, optional): Number of steps over which to decay learning rate. Defaults to 0.
         lr_decay_coeff (float, optional): Coefficient for learning rate decay. Defaults to 0.1.
+        rng_seed (int, optional): Master PRNG seed for reproducibility. Defaults to 0.
     """
     def __init__(
         self,
         diffusion_model: nnx.Module,
         folder: str, # Used as base for results/checkpoints if not specified
         *,
+        rng_seed: int = 0,
         dataset_path: str,
         num_frames: int = 16,
         train_batch_size: int = 4,
@@ -97,6 +99,9 @@ class Trainer:
     ):
         """Initializes the Trainer instance."""
         super().__init__()
+
+        # --- PRNG Key Setup ---
+        self.key = jax.random.PRNGKey(rng_seed)
 
         # EMA Configuration
         self.step_start_ema = step_start_ema
@@ -214,12 +219,13 @@ class Trainer:
 
         # --- Loss Function Definition ---
         # Defined within train to capture self.use_path_as_cond easily
-        def compute_loss(model, batch_data, prob_focus_present, focus_present_mask):
+        def compute_loss(model, batch_data, key, prob_focus_present, focus_present_mask):
             if self.use_path_as_cond:
                 # Assuming batch_data is a tuple (video, condition)
                 video_data, cond_data = batch_data
                 loss = model(
                     video_data,
+                    key=key,
                     cond=cond_data,
                     prob_focus_present=prob_focus_present,
                     focus_present_mask=focus_present_mask
@@ -228,6 +234,7 @@ class Trainer:
                 # Assuming batch_data is just the video tensor
                 loss = model(
                     batch_data,
+                    key=key,
                     prob_focus_present=prob_focus_present,
                     focus_present_mask=focus_present_mask
                 )
@@ -237,7 +244,11 @@ class Trainer:
 
         # --- Training Loop ---
         losses = []
+        key = self.key
         while self.step < self.train_num_steps:
+            # --- Split Key for the current step ---
+            key, step_key = jax.random.split(key)
+
             # --- Data Loading and Preprocessing ---
             # TODO: Make data loading/preprocessing more robust and configurable
             try:
@@ -262,13 +273,15 @@ class Trainer:
             loss, grads = grad_fn(
                 self.model,
                 batch_data,
+                step_key,
                 prob_focus_present,
                 focus_present_mask,
             )
 
             # Gradient Clipping
             if self.max_grad_norm is not None:
-                grads = clip_grad_norm(grads, max_grad_norm=self.max_grad_norm)
+                grads, l2_norm = clip_grad_norm(grads, max_grad_norm=self.max_grad_norm)
+                self.writer.add_scalar('grads/pre_clip_l2_norm', float(l2_norm), self.step)
 
             self.optimizer.update(grads)
 
@@ -312,6 +325,9 @@ class Trainer:
 
             self.step += 1
         # --- End of Training Loop ---
+
+        # Update self.key with the final state after the loop
+        self.key = key
 
         print('Training completed!')
         # Save final checkpoint
