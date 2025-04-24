@@ -240,8 +240,14 @@ class Unet3D(nnx.Module):
 
         out_dim = default(out_dim, channels)
 
+        # Get the output dimension from the block_klass
+        # Note: This assumes block_klass doesn't change the input dimension 'dim'.
+        # If block_klass outputs a different dimension, this needs adjustment.
+        final_block_out_dim = dim 
+
         self.final_conv = nnx.Sequential(
-            block_klass(dim * 2, dim), nnx.Conv(dim, out_dim, 1, rngs=rngs)  # Resnet
+            block_klass(dim * 2, final_block_out_dim), # ResnetBlock
+            nnx.Conv(final_block_out_dim, out_dim, 1, rngs=rngs) # Final 1x1 Conv
         )
 
     def forward_with_cond_scale(self, *args, cond_scale=2.0, **kwargs):
@@ -336,4 +342,31 @@ class Unet3D(nnx.Module):
         x = jnp.concat((x, r), axis=-1)
         if self.log_dims:
             print(f"final conv:{x.shape}")
-        return self.final_conv(x)
+        # return self.final_conv(x)
+
+        # # --- Start Debugging Large output activations ---
+        # # Manually apply final_conv layers to log intermediate activation
+        # # Apply the first part (block_klass)
+        # # Access layers via the .layers attribute
+        # intermediate = self.final_conv.layers[0](x)
+        # # intermediate = self.final_conv.layers[1](intermediate)
+        
+        # # Log statistics of the input to the final Conv layer
+        # input_norm = jnp.linalg.norm(intermediate)
+        # mean_abs = jnp.mean(jnp.abs(intermediate))
+        # jax.debug.print("--- Input to final_conv Conv layer ---")
+        # jax.debug.print("Shape: {s}, Norm: {norm:.4e}, Mean Abs: {ma:.4e}",
+        #                 s=intermediate.shape, norm=input_norm, ma=mean_abs)
+
+        # # Apply the second part (Conv layer)
+        # # Access layers via the .layers attribute
+        # out = self.final_conv.layers[-1](intermediate)
+        # # Log statistics of the output of the final Conv layer
+        # out_norm = jnp.linalg.norm(out)
+        # out_mean_abs = jnp.mean(jnp.abs(out))
+        # jax.debug.print("--- Output of final_conv Conv layer ---")
+        # jax.debug.print("Shape: {s}, Norm: {norm:.4e}, Mean Abs: {ma:.4e}",
+        #                 s=out.shape, norm=out_norm, ma=out_mean_abs)
+        # # --- End Debugging Large output activations ---
+
+        return out

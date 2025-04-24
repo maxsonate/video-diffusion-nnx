@@ -151,10 +151,74 @@ def clip_grad_norm(grads, max_grad_norm, epsilon=1e-6):
   # logging.info(f'clip scale:{scale}') # Keep as comment or remove if not needed for debug
   return tree_util.tree_map(lambda x: x * scale, grads), l2_norm
 
-grads_test = {
-        'weights': jnp.array([1, 2, 3]),
-        'biases': jnp.array([4, 5]),
-        }
+
+
+def clip_grad_norm_with_tb_logging(grads, max_grad_norm, tb_writer, step, epsilon=1e-6):
+  """Clips gradients by global L2 norm and logs diagnostic information to TensorBoard.
+
+  Computes the global L2 norm of all gradients in the PyTree `grads`.
+  If the norm exceeds `max_grad_norm`, scales all gradients uniformly such that
+  the global norm equals `max_grad_norm`. Otherwise, gradients remain unchanged.
+
+  Additionally, logs the following to TensorBoard at the given `step`:
+    - 'global_grad_norm/pre_clip': The global L2 norm before clipping.
+    - 'global_grad_norm/clip_scale': The scaling factor applied (1.0 if no clipping occurred).
+    - 'per_param_grad_norm/<path>': The L2 norm of the gradient for each individual
+      parameter (leaf node) in the `grads` PyTree. The `<path>` reflects the
+      parameter's position within the PyTree structure (e.g., "['layer1'][0]['weights']").
+
+  Args:
+    grads: A PyTree of gradients.
+    max_grad_norm: The maximum allowed global L2 norm for the gradients.
+    tb_writer: A TensorBoard summary writer instance (e.g., from `flax.metrics.tensorboard`).
+    step: The current training step (integer) for logging.
+    epsilon: A small float added to the norm calculation for numerical stability,
+      preventing division by zero.
+
+  Returns:
+    A tuple containing:
+      - grads: The (potentially scaled) PyTree of gradients.
+      - l2_norm: The computed global L2 norm *before* clipping.
+  """
+
+  # Compute squared L2 norm per leaf
+  grad_squared = tree_util.tree_map(lambda x: jnp.sum(x**2), grads)
+  # Sum over all leaves to get total squared norm
+  total_sq = tree_util.tree_reduce(jnp.add, grad_squared, 0.0)
+  # Global L2 norm (pre-clipping)
+  l2_norm = jnp.sqrt(total_sq + epsilon)
+
+  # Compute clipping scale; ensure norm does not exceed max_grad_norm
+  scale = jnp.minimum(max_grad_norm / (l2_norm + epsilon), 1.0)
+
+  # Log global norm and scale factor
+  tb_writer.add_scalar('global_grad_norm/pre_clip', np.asarray(l2_norm), step)
+  tb_writer.add_scalar('global_grad_norm/clip_scale', np.asarray(scale), step)
+
+  # Apply clipping
+  clipped_grads = tree_util.tree_map(lambda x: x * scale, grads)
+
+  # Log per-parameter norms to TensorBoard (using the squared norms calculated earlier)
+  per_param_norms = tree_util.tree_map(lambda sq: jnp.sqrt(sq + epsilon), grad_squared)
+  per_param_norms_with_paths = tree_util.tree_leaves_with_path(per_param_norms)
+
+  # Format path and log each per-parameter norm
+  for path, leaf_norm in per_param_norms_with_paths:
+    path_str_parts = []
+    for entry in path:
+        if isinstance(entry, tree_util.DictKey):
+            # Use '.' for nesting instead of brackets for cleaner TB names
+            path_str_parts.append(f"{entry.key}")
+        elif isinstance(entry, tree_util.SequenceKey):
+            path_str_parts.append(f"{entry.idx}")
+        else:
+            path_str_parts.append(str(entry))
+    # Join with '.' for a hierarchical tag in TensorBoard
+    path_str = '.'.join(path_str_parts)
+    # Add a prefix to avoid potential collisions with other logs
+    tb_writer.add_scalar(f'per_param_grad_norm/{path_str}', np.asarray(leaf_norm), step)
+
+  return clipped_grads, l2_norm
 
 
 

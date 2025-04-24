@@ -19,6 +19,7 @@ from utils import (
     save_checkpoint,
     load_checkpoint,
     clip_grad_norm,
+    clip_grad_norm_with_tb_logging,
     # cycle # Imported from itertools
 )
 import orbax.checkpoint as ocp
@@ -280,7 +281,8 @@ class Trainer:
 
             # Gradient Clipping
             if self.max_grad_norm is not None:
-                grads, l2_norm = clip_grad_norm(grads, max_grad_norm=self.max_grad_norm)
+                # grads, l2_norm = clip_grad_norm(grads, max_grad_norm=self.max_grad_norm)
+                grads, l2_norm = clip_grad_norm_with_tb_logging(grads, max_grad_norm=self.max_grad_norm, tb_writer=self.writer, step=self.step)
                 self.writer.add_scalar('grads/pre_clip_l2_norm', float(l2_norm), self.step)
 
             self.optimizer.update(grads)

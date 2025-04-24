@@ -4,7 +4,6 @@ from flax import nnx
 from tqdm import tqdm
 from einops import rearrange
 from einops_exts import check_shape
-import random as r
 from video_diffusion_pytorch.text import tokenize, bert_embed
 
 # Assuming utils.py contains relevant functions like cosine_beta_schedule, extract, etc.
@@ -23,6 +22,8 @@ class GaussianDiffusion(nnx.Module):
   Handles the forward diffusion process (adding noise) and the reverse
   process (sampling/denoising) using a provided denoising model (U-Net).
   Also calculates the loss for training the denoising model.
+
+  Requires explicit PRNGKeys for all random operations.
 
   Attributes:
     denoise_fn: The neural network model (e.g., a U-Net) used to predict noise.
@@ -161,6 +162,10 @@ class GaussianDiffusion(nnx.Module):
     and then using the formula for the posterior q(x_{t-1} | x_t, x_0_pred)
     to get the mean and variance of the reverse step.
 
+    Note: This function itself doesn't require a PRNGKey as randomness comes
+          from the sampling step (p_sample). Denoise_fn might need one internally
+          if it uses dropout, but that should be handled within denoise_fn.
+
     Args:
       x: The noisy image at timestep t (x_t) with shape (batch, channels, frames, height, width).
       t: The timestep indices (scalar or batch) with shape (batch,).
@@ -204,8 +209,8 @@ class GaussianDiffusion(nnx.Module):
             )
             s = jnp.maximum(s, 1.0) # Ensure threshold is at least 1.0
             # Reshape threshold s for broadcasting: (b,) -> (b, 1, 1, 1, 1)
-            # Using x_recon.ndim instead of the previous arr.ndim
-            s = jnp.reshape(s, (-1, *(1,) * (x_recon.ndim - 1)))
+            # Using einops is clearer:
+            s = rearrange(s, 'b -> b 1 1 1 1')
 
         # Clip x_recon to [-s, s] and rescale to [-1, 1]
         x_recon = jnp.clip(x_recon, -s, s) / s
@@ -219,12 +224,13 @@ class GaussianDiffusion(nnx.Module):
     return model_mean, posterior_variance, posterior_log_variance
 
 
-  def p_sample(self, x: jax.Array, t: jax.Array, cond=None, cond_scale: float = 1., clip_denoised: bool = True) -> jax.Array:
+  def p_sample(self, x: jax.Array, t: jax.Array, key: jax.random.PRNGKey, cond=None, cond_scale: float = 1., clip_denoised: bool = True) -> jax.Array:
     """Samples x_{t-1} from the reverse process distribution p(x_{t-1} | x_t).
 
     Args:
-      x: The noisy image at timestep t (x_t) with shape (batch, channels, frames, height, width).
-      t: The timestep indices (scalar or batch) with shape (batch,).
+      x: The noisy image at timestep t (x_t).
+      t: The timestep indices (scalar or batch).
+      key: JAX PRNGKey for generating sampling noise.
       cond: Optional conditioning information.
       cond_scale: Scale factor for classifier-free guidance.
       clip_denoised: Whether to clip the predicted x_0 during mean calculation.
@@ -240,25 +246,25 @@ class GaussianDiffusion(nnx.Module):
         cond_scale=cond_scale # Pass cond_scale if p_mean_variance uses it
     )
 
-    # Generate noise for sampling step
-    noise = jax.random.normal(jax.random.PRNGKey(r.randint(0, 100)), shape=x.shape, dtype=x.dtype)
+    # Generate noise for sampling step using the provided key
+    noise = jax.random.normal(key, shape=x.shape, dtype=x.dtype)
 
     # No noise added at the final step (t=0)
     nonzero_mask = (1.0 - (t == 0).astype(jnp.float32))
-    # Reshape mask for broadcasting: (b,) -> (b, 1, 1, 1, 1)
-    nonzero_mask = rearrange(nonzero_mask, 'b -> b 1 1 1 1')
+    nonzero_mask = rearrange(nonzero_mask, 'b -> b 1 1 1 1') # Reshape mask for broadcasting
 
     # Combine mean and noise (scaled by variance)
     return model_mean + nonzero_mask * jnp.exp(0.5 * model_log_variance) * noise
 
 
-  def p_sample_loop(self, shape: tuple, cond=None, cond_scale: float = 1.) -> jax.Array:
+  def p_sample_loop(self, shape: tuple, key: jax.random.PRNGKey, cond=None, cond_scale: float = 1.) -> jax.Array:
     """Generates samples by iteratively applying the reverse diffusion process.
 
     Starts from random noise and denoises it over `num_timesteps`.
 
     Args:
       shape: The desired shape of the output samples (batch, channels, frames, height, width).
+      key: JAX PRNGKey for the entire sampling loop.
       cond: Optional conditioning information.
       cond_scale: Scale factor for classifier-free guidance.
 
@@ -266,15 +272,19 @@ class GaussianDiffusion(nnx.Module):
       The generated samples (images/videos) with the specified shape, unnormalized to [0, 1].
     """
     batch_size = shape[0]
-    # Start with random noise
-    img = jax.random.normal(key=jax.random.PRNGKey(r.randint(0, 100)), shape=shape)
+    # Split key for initial noise and the loop
+    key, init_noise_key = jax.random.split(key)
+    img = jax.random.normal(key=init_noise_key, shape=shape)
 
     # Iteratively denoise from t=num_timesteps-1 down to t=0
     for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling loop', total=self.num_timesteps):
         current_t = jnp.full((batch_size,), i, dtype=jnp.int32)
+        # Split key for this step's sample
+        key, step_key = jax.random.split(key)
         img = self.p_sample(
             img,
             current_t,
+            key=step_key, # Pass the key for this step
             cond=cond,
             cond_scale=cond_scale
             # clip_denoised is True by default in p_sample
@@ -284,12 +294,13 @@ class GaussianDiffusion(nnx.Module):
     return unnormalize_img(img)
 
 
-  def sample(self, cond=None, cond_scale: float = 1., batch_size: int = 16) -> jax.Array:
+  def sample(self, key: jax.random.PRNGKey, cond=None, cond_scale: float = 1., batch_size: int = 16) -> jax.Array:
     """Generates samples from the diffusion model.
 
     Handles potential text conditioning preprocessing before calling p_sample_loop.
 
     Args:
+      key: JAX PRNGKey for the sampling process.
       cond: Optional conditioning information. If list of strings, they are tokenized and embedded.
       cond_scale: Scale factor for classifier-free guidance.
       batch_size: The number of samples to generate if no condition is provided.
@@ -317,7 +328,7 @@ class GaussianDiffusion(nnx.Module):
     )
 
     # Run the sampling loop
-    return self.p_sample_loop(shape=sample_shape, cond=cond, cond_scale=cond_scale)
+    return self.p_sample_loop(shape=sample_shape, key=key, cond=cond, cond_scale=cond_scale)
 
 
   def interpolate(self, x1: jax.Array, x2: jax.Array, t: int | None = None, lam: float = 0.5) -> jax.Array:
@@ -361,32 +372,30 @@ class GaussianDiffusion(nnx.Module):
     return img_latent # Return the final denoised image
 
 
-  def q_sample(self, x_start: jax.Array, t: int, noise: jax.Array | None):
-    """Samples from the forward diffusion process q(x_t | x_0) at timestep t.
-
-    Adds noise to the initial image x_start according to the diffusion schedule.
+  def q_sample(self, x_start: jax.Array, t: int, key: jax.random.PRNGKey, noise: jax.Array | None = None):
+    """Samples from the forward diffusion process q(x_t | x_0).
 
     Args:
-      x_start: The initial image (x_0) with shape (batch, channels, frames, height, width).
-      t: The timestep indices (scalar or batch) with shape (batch,).
-      noise: Optional noise tensor to use. If None, random noise is generated.
-             Must have the same shape as x_start.
+      x_start: Initial image (x_0).
+      t: Timestep indices.
+      key: JAX PRNGKey, required if noise is None.
+      noise: Optional noise tensor. If None, random noise is generated using key.
 
     Returns:
       The noisy image x_t with the same shape as x_start.
     """
     # Generate noise if not provided
     if noise is None:
-        noise = jax.random.normal(jax.random.PRNGKey(r.randint(0, 100)), shape=x_start.shape)
+        assert key is not None, "A PRNGKey must be provided to q_sample if noise is not."
+        noise = jax.random.normal(key, shape=x_start.shape)
 
-    # Apply the forward diffusion formula
     return (
         extract(self.sqrt_alphas_cumprod.value, t, x_start.shape) * x_start +
         extract(self.sqrt_one_minus_alphas_cumprod.value, t, x_start.shape) * noise
     )
 
 
-  def p_losses(self, x_start: jax.Array, t: jax.Array, cond=None, noise: jax.Array | None = None, **kwargs) -> jax.Array:
+  def p_losses(self, x_start: jax.Array, t: jax.Array, key: jax.random.PRNGKey, cond=None, noise: jax.Array | None = None, **kwargs) -> jax.Array:
     """Calculates the training loss for the diffusion model.
 
     Adds noise to x_start to get x_t, predicts the noise using the denoise_fn,
@@ -395,6 +404,7 @@ class GaussianDiffusion(nnx.Module):
     Args:
       x_start: The initial images (batch, channels, frames, height, width).
       t: The timestep indices (scalar or batch) with shape (batch,).
+      key: JAX PRNGKey for noise generation and potentially q_sample.
       cond: Optional conditioning information.
       noise: Optional noise tensor to use for q_sample. If None, random noise is generated.
       **kwargs: Additional keyword arguments passed to the denoise_fn.
@@ -402,13 +412,15 @@ class GaussianDiffusion(nnx.Module):
     Returns:
       The calculated loss (scalar).
     """
+    # Split key for noise generation and potentially q_sample
+    key, noise_key, q_sample_key = jax.random.split(key, 3)
+
     # Generate noise if not provided
     if noise is None:
-        noise = jax.random.normal(jax.random.PRNGKey(r.randint(0, 100)), shape=x_start.shape)
+        noise = jax.random.normal(noise_key, shape=x_start.shape)
 
-    # Create noisy version of x_start at timestep t
-    # TBD comment clarification: This correctly samples x_t using the formula for q(x_t|x_0)
-    x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+    # Create noisy version using q_sample, passing a key if it needs to generate noise
+    x_noisy = self.q_sample(x_start=x_start, t=t, key=q_sample_key, noise=noise) # Use generated noise
 
     # Preprocess text condition if necessary
     if is_list_str(cond):
@@ -433,13 +445,14 @@ class GaussianDiffusion(nnx.Module):
     return loss
 
 
-  def __call__(self, x: jax.Array, *args, **kwargs) -> jax.Array:
+  def __call__(self, x: jax.Array, key: jax.random.PRNGKey, *args, **kwargs) -> jax.Array:
     """Defines the forward pass for training, calculating the loss.
 
     Normalizes the input image, selects random timesteps, and calls p_losses.
 
     Args:
       x: The initial images (batch, channels, frames, height, width).
+      key: JAX PRNGKey for the entire loss calculation step.
       *args: Positional arguments passed to p_losses (e.g., conditioning).
       **kwargs: Keyword arguments passed to p_losses.
 
@@ -451,11 +464,14 @@ class GaussianDiffusion(nnx.Module):
     # Check input shape matches configuration
     check_shape(x, 'b c f h w', b=batch_size, c=self.channels, f=self.num_frames, h=img_size, w=img_size)
 
+    # Split key for timestep sampling and loss calculation
+    key, t_key, loss_key = jax.random.split(key, 3)
+
     # Sample random timesteps for the batch
-    t = jax.random.randint(jax.random.PRNGKey(r.randint(0, 100)), (batch_size,), 0, self.num_timesteps, dtype=jnp.int32)
+    t = jax.random.randint(t_key, (batch_size,), 0, self.num_timesteps, dtype=jnp.int32)
 
     # Normalize images from [0, 1] to [-1, 1] (if needed)
     x_normalized = normalize_img(x)
 
-    # Calculate and return the loss
-    return self.p_losses(x_normalized, t, *args, **kwargs)
+    # Calculate and return the loss, passing the loss-specific key
+    return self.p_losses(x_normalized, t, key=loss_key, *args, **kwargs)

@@ -205,6 +205,7 @@ class ResnetBlock(nnx.Module):
                                   out_features=out_features * 2,
                                   rngs=rngs)
                               ) if time_emb_dim is not None else None
+    self.norm_1 = nnx.LayerNorm(out_features * 2, rngs=rngs)
     self.block_1 = Block(in_features=in_features,
                          out_features=out_features,
                          groups = groups,
@@ -219,6 +220,7 @@ class ResnetBlock(nnx.Module):
                              out_features=out_features,
                              kernel_size = 1,
                              rngs=rngs) if in_features != out_features else Identity()
+    self.norm_2 = nnx.LayerNorm(out_features, rngs=rngs)
 
 
   def __call__(self, x:jax.Array, time_embed : jax.Array | None = None):
@@ -229,6 +231,7 @@ class ResnetBlock(nnx.Module):
       assert time_embed is not None, 'time emb must be passed in'
 
       time_embed = self.mlp(time_embed)
+      time_embed = self.norm_1(time_embed)
       time_embed = rearrange(time_embed, 'b c -> b 1 1 1 c' ) # It is BxC, because we have one time stamp for each frame.
       # TODO: double check if the dimesion is correct here. channel is assumed to be dim 1.
 
@@ -236,7 +239,8 @@ class ResnetBlock(nnx.Module):
 
     h = self.block_1(x, scale_shift = scale_shift)
     h = self.block_2(h)
-    return h + self.res_conv(x)
+    h = h + self.norm_2(self.res_conv(x))
+    return h
 
 
 # Multihead attention for temporal attention
