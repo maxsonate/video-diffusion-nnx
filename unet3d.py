@@ -342,31 +342,4 @@ class Unet3D(nnx.Module):
         x = jnp.concat((x, r), axis=-1)
         if self.log_dims:
             print(f"final conv:{x.shape}")
-        # return self.final_conv(x)
-
-        # # --- Start Debugging Large output activations ---
-        # # Manually apply final_conv layers to log intermediate activation
-        # # Apply the first part (block_klass)
-        # # Access layers via the .layers attribute
-        # intermediate = self.final_conv.layers[0](x)
-        # # intermediate = self.final_conv.layers[1](intermediate)
-        
-        # # Log statistics of the input to the final Conv layer
-        # input_norm = jnp.linalg.norm(intermediate)
-        # mean_abs = jnp.mean(jnp.abs(intermediate))
-        # jax.debug.print("--- Input to final_conv Conv layer ---")
-        # jax.debug.print("Shape: {s}, Norm: {norm:.4e}, Mean Abs: {ma:.4e}",
-        #                 s=intermediate.shape, norm=input_norm, ma=mean_abs)
-
-        # # Apply the second part (Conv layer)
-        # # Access layers via the .layers attribute
-        # out = self.final_conv.layers[-1](intermediate)
-        # # Log statistics of the output of the final Conv layer
-        # out_norm = jnp.linalg.norm(out)
-        # out_mean_abs = jnp.mean(jnp.abs(out))
-        # jax.debug.print("--- Output of final_conv Conv layer ---")
-        # jax.debug.print("Shape: {s}, Norm: {norm:.4e}, Mean Abs: {ma:.4e}",
-        #                 s=out.shape, norm=out_norm, ma=out_mean_abs)
-        # # --- End Debugging Large output activations ---
-
-        return out
+        return self.final_conv(x)
