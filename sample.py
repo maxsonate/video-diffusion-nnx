@@ -9,6 +9,7 @@ from unet3d import Unet3D
 from gaussian_diffusion import GaussianDiffusion
 from utils import load_checkpoint, video_array_to_gif
 from einops import rearrange
+import jax
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +41,13 @@ def main():
         default=0,
         help='Checkpoint step number to load'
     )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=0,
+        help='Random seed for sampling'
+    )
+
     parser.add_argument(
         '--load-ema-params',
         type=bool,
@@ -83,7 +91,9 @@ def main():
     diffusion_model, _ = load_checkpoint(diffusion_model, args.step, str(checkpoint_path), load_ema_params=args.load_ema_params)
     logging.info(f"Loaded checkpoint from {checkpoint_path} at step {args.step}")
 
-    sampled_videos = diffusion_model.sample()
+    # Create PRNG key for sampling
+    key = jax.random.PRNGKey(args.seed)
+    sampled_videos = diffusion_model.sample(key)
     logging.info(f"Sampled {len(sampled_videos)} videos")
 
     # Rearrange dimensions and normalize to [0,255]
@@ -93,8 +103,11 @@ def main():
     normalized = (sampled_videos - min_val) / (max_val - min_val)
     uint8_videos = (normalized * 255).astype(jnp.uint8)
 
-    # Convert to NumPy and save as GIF
-    video_array_to_gif(np.array(uint8_videos[1]), output_path / 'test_vid.gif')
+    # Convert to NumPy and save each video as a separate GIF
+    for i, video_np in enumerate(np.array(uint8_videos)):
+        output_filename = output_path / f'sample_{i}.gif'
+        video_array_to_gif(video_np, output_filename)
+        logging.info(f"Saved sample {i} to {output_filename}")
 
 if __name__ == "__main__":
     main()
