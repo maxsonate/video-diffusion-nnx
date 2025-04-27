@@ -372,26 +372,6 @@ def video_array_to_gif(arr, path, duration = 120, loop = 0, optimize = True):
                  optimize = optimize)
   return images
 
-# Function that takes a path to a GIF file and returns a tensor of shape
-# (channels, frames, height, width)
-def gif_to_array(path, channels = 3, transform= T.ToTensor()):
-  """Loads a GIF file and converts it into a tensor.
-
-  Depends on PIL, torch, and torchvision.
-
-  Args:
-    path (str): Path to the GIF file.
-    channels (int): Desired number of channels for the output tensor (1, 3, or 4). Defaults to 3.
-    transform (callable): A function (like torchvision.transforms.ToTensor) to apply to each frame. Defaults to T.ToTensor().
-
-  Returns:
-    jnp.ndarray: A JAX array of shape (channels, frames, height, width).
-  """
-  img = Image.open(path)
-  tensors = tuple(map(transform, seek_all_images(img, channels = channels)))
-  tensors = torch.stack(tensors, dim = 1)
-  return jnp.asarray(tensors.numpy())
-
 # Function that pads or truncates an array of shape (channels,frames, height, width)
 # to the specific number of frames
 # If the array already has the specified number of frames, the function returns it unchanged.

@@ -1,0 +1,43 @@
+unet:
+  # Parameters for Unet3D
+  dim: 32                # Base channel dimension
+  rngs_seed: 0           # Seed for nnx.Rngs
+  dim_mults: [1, 2, 4, 8]
+  channels: 1
+  use_bert_text_cond: false
+
+diffusion:
+  # Parameters for GaussianDiffusion
+  image_size: 64
+  num_frames: 10
+  timesteps: 1000
+  loss_type: "l2"
+  channels: 1
+
+trainer:
+  # Parameters for the training process
+  folder: "./results/v2_2"
+  dataset_path: "data/mnist_test_seq_100.npy"
+  train_batch_size: 4
+  train_lr: 0.0001
+  train_num_steps: 100000
+  lr_decay_start_step: 20000
+  lr_decay_steps: 80000
+  lr_decay_coeff: 0.1
+  num_frames: 10
+  gradient_accumulate_every: 2
+  step_start_ema: 2000
+  update_ema_every: 10
+  save_and_sample_every: 100000
+  results_folder: "./results"
+  num_sample_rows: 10
+  max_grad_norm: 10000000
+  use_path_as_cond: false
+  sample_text: null
+  cond_scale: 2.0
+  checkpoint_every_steps: 10
+  checkpoint_dir_path: ""
+  add_loss_plot: false
+  resume_training_step: 0
+  tensorboard_dir: "./results/tensorboard/v2_2" 
+  max_to_keep: 100

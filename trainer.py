@@ -140,15 +140,17 @@ class Trainer:
         self.image_size = diffusion_model.image_size
         model_num_frames = diffusion_model.num_frames
         # TODO: Make dataset loading more flexible (handle different types/paths)
-        print(f"Loading dataset from: {dataset_path}")
+        logging.info(f"Loading dataset from: {dataset_path}")
         self.ds = MovingMNIST(
             dataset_path,
             image_size=(self.image_size, self.image_size),
             num_frames=model_num_frames, # Use frames from model if not passed explicitly?
             force_num_frames=True
         )
-        print(f'Found {len(self.ds)} sequences in dataset.')
-        assert len(self.ds) > 0, 'Dataset is empty. Check path and format.'
+        # Get the total number of samples in the dataset
+        num_samples = len(self.ds)
+        logging.info(f"Found {num_samples} sequences in dataset.")
+        assert num_samples > 0, "Dataset is empty. Check path and format."
         self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True, pin_memory=True))
 
         # --- Results and Checkpointing ---
@@ -164,26 +166,26 @@ class Trainer:
         # --- Orbax Checkpoint Manager ---
         options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
         self.ckpt_manager = CheckpointManager(self.checkpoint_dir_path, options=options)
-        print(f"Checkpoint manager initialized at {self.checkpoint_dir_path} with max_to_keep={max_to_keep}")
+        logging.info(f"Checkpoint manager initialized at {self.checkpoint_dir_path} with max_to_keep={max_to_keep}")
 
         # --- TensorBoard Setup ---
         self.tensorboard_dir = Path(tensorboard_dir).resolve() if tensorboard_dir else self.results_folder / 'tensorboard'
         self.tensorboard_dir.mkdir(exist_ok=True, parents=True)
         self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
-        print(f"TensorBoard logs will be saved to: {self.tensorboard_dir}")
+        logging.info(f"TensorBoard logs will be saved to: {self.tensorboard_dir}")
 
         # --- State ---
         self.step = resume_training_step
         if self.step > 0:
-            print(f"Attempting to resume training from step {self.step}")
+            logging.info(f"Attempting to resume training from step {self.step}")
             # TODO: Implement checkpoint loading using load_checkpoint utility
             try:
                 self.model, self.ema_params = load_checkpoint(self.model, self.step, self.checkpoint_dir_path, ckpt_manager=self.ckpt_manager, load_ema_params=False)
 
                 # TODO: Load optimizer state as well
-                print(f"Successfully loaded checkpoint from step {self.step}")
+                logging.info(f"Successfully loaded checkpoint from step {self.step}")
             except FileNotFoundError:
-                print(f"Warning: Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}. Starting from step 0.")
+                logging.warning(f"Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}. Starting from step 0.")
                 self.step = 0
 
         # --- Visualization (Not Implemented) ---
@@ -200,7 +202,7 @@ class Trainer:
         Returns:
             Dummy JAX array matching expected sample dimensions.
         """
-        print("Warning: sample_batch called, but sampling/EMA is not implemented.")
+        logging.warning("Warning: sample_batch called, but sampling/EMA is not implemented.")
         # Replace with actual model sampling if/when re-enabled
         shape = (batch_size, self.model.channels, self.model.num_frames, self.image_size, self.image_size)
         return jnp.zeros(shape)
@@ -216,7 +218,7 @@ class Trainer:
                                          Defaults to a no-op.
         """
         assert callable(log_fn)
-        print(f"Starting training loop from step {self.step}...")
+        logging.info(f"Starting training loop from step {self.step}...")
 
         # --- Loss Function Definition ---
         # Defined within train to capture self.use_path_as_cond easily
@@ -256,7 +258,7 @@ class Trainer:
                 batch_torch = next(self.dl)
                 batch_data = jnp.array(batch_torch.detach().cpu().numpy())
             except StopIteration:
-                print("Dataloader exhausted. Re-initializing.") # Should not happen with cycle
+                logging.warning("Dataloader exhausted unexpectedly. Re-initializing.")
                 self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True, pin_memory=True))
                 batch_torch = next(self.dl)
                 batch_data = jnp.array(batch_torch.detach().cpu().numpy())
@@ -290,7 +292,7 @@ class Trainer:
             # --- Logging ---
             current_loss = float(np.array(loss))
             losses.append(current_loss)
-            print(f"Step: {self.step}/{self.train_num_steps} | Loss: {current_loss:.4f}", flush=True)
+            logging.info(f"Step: {self.step}/{self.train_num_steps} | Loss: {current_loss:.4f}")
             log_fn({'loss': current_loss, 'step': self.step})
 
             # --- TensorBoard Logging ---
@@ -308,16 +310,18 @@ class Trainer:
                     lambda ema_p, p: self.ema_decay * ema_p + (1 - self.ema_decay) * p,
                     self.ema_params, curr_params
                 )
-                print(f"Step: {self.step} | Updated EMA parameters")
+                # Reduce frequency of EMA update logging
+                if self.step % (self.update_ema_every * 10) == 0: # Log every 10 EMA updates
+                    logging.debug(f"Step: {self.step} | Updated EMA parameters")
 
             # --- Checkpointing ---
             if self.step > 0 and self.step % self.checkpoint_every_steps == 0:
-                print(f"Step: {self.step} | Saving checkpoint...", flush=True)
+                logging.info(f"Step: {self.step} | Saving checkpoint...")
                 try:
                     save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.step)
                     # TODO: Save optimizer state as well
                 except Exception as e:
-                    print(f"Error saving checkpoint at step {self.step}: {e}")
+                    logging.error(f"Error saving checkpoint at step {self.step}: {e}")
 
             # --- Sampling (Removed) ---
             # if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -331,19 +335,18 @@ class Trainer:
         # Update self.key with the final state after the loop
         self.key = key
 
-        print('Training completed!')
+        logging.info('Training completed!')
         # Save final checkpoint
-        print("Saving final checkpoint...", flush=True)
+        logging.info("Saving final checkpoint...")
         try:
-            save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.optimizer.opt_state, self.step)
-            # TODO: Save final optimizer state
+            save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.step)
         except Exception as e:
-            print(f"Error saving final checkpoint at step {self.step}: {e}")
+            logging.error(f"Error saving final checkpoint at step {self.step}: {e}")
 
         # Close TensorBoard writer
         self.writer.close()
-        print(f"TensorBoard logs saved to: {self.tensorboard_dir}")
-        print(f"View TensorBoard with: tensorboard --logdir={self.tensorboard_dir}")
+        logging.info(f"TensorBoard logs saved to: {self.tensorboard_dir}")
+        logging.info(f"View TensorBoard with: tensorboard --logdir={self.tensorboard_dir}")
 
     # --- Sampling Method (Removed - Placeholder left above) ---
     # def generate_samples(self, milestone: int):

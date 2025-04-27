@@ -1,6 +1,7 @@
 import math
 from functools import partial
 from typing import Any, Sequence, Tuple
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -308,38 +309,79 @@ class Unet3D(nnx.Module):
             )  # Temporal Attention
             h.append(x)
             if self.log_dims:
-                print(f"pre downsample:{x.shape}")
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Down: Pre downsample: {shape_str}")
             x = downsample(x)  # Downsample
 
         # Mid blocks:
+        if self.log_dims:
+            shape_str = ", ".join(map(str, x.shape))
+            logging.debug(f"Mid: Block 1 input: {shape_str}")
         x = self.mid_block1(x, t)  # Resnet
+        if self.log_dims:
+            shape_str = ", ".join(map(str, x.shape))
+            logging.debug(f"Mid: Spatial Attn input: {shape_str}")
         x = self.mid_spatial_attn(x)  # Spatial Attention
+        if self.log_dims:
+            shape_str = ", ".join(map(str, x.shape))
+            logging.debug(f"Mid: Temporal Attn input: {shape_str}")
         x = self.mid_temporal_attn(
             x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask
         )  # Temporal Attention
+        if self.log_dims:
+            shape_str = ", ".join(map(str, x.shape))
+            logging.debug(f"Mid: Block 2 input: {shape_str}")
         x = self.mid_block2(x, t)  # Resnet
 
         # Iterate over the ups blocks
-        for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
+        for i, (block1, block2, spatial_attn, temporal_attn, upsample) in enumerate(self.ups):
             if self.log_dims:
-                print(f"ups pre concat:{x.shape}")
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Up {i}: Pre-concat shape: {shape_str}")
+            # Pop from the end of h (corresponding skip connection)
+            skip_connection = h.pop()
+            if self.log_dims:
+                skip_shape_str = ", ".join(map(str, skip_connection.shape))
+                logging.debug(f"Up {i}: Skip connection shape: {skip_shape_str}")
             x = jnp.concat(
-                (x, h.pop()), axis=-1
-            )  # The corresponding feature map from the contracting path is concatenated with the current feature map
+                (x, skip_connection), axis=-1
+            )  # Concatenate along the channel dimension (last axis)
             if self.log_dims:
-                print(f"ups: block1 :{x.shape}")
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Up {i}: Post-concat shape / Block 1 input: {shape_str}")
             x = block1(x, t)  # Resnet
+            if self.log_dims:
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Up {i}: Block 2 input: {shape_str}")
             x = block2(x, t)  # Resent
+            if self.log_dims:
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Up {i}: Spatial Attn input: {shape_str}")
             x = spatial_attn(x)  # Spatial Attention
-
+            if self.log_dims:
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Up {i}: Temporal Attn input: {shape_str}")
             x = temporal_attn(
                 x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask
             )  # Temporal attention
             if self.log_dims:
-                print(f"pre upsample:{x.shape}")
+                shape_str = ", ".join(map(str, x.shape))
+                logging.debug(f"Up {i}: Pre-upsample shape: {shape_str}")
             x = upsample(x)  # Upsample
 
+        # Final concatenation with residual connection
+        if self.log_dims:
+            shape_str = ", ".join(map(str, x.shape))
+            res_shape_str = ", ".join(map(str, r.shape))
+            logging.debug(f"Final concat: Current shape {shape_str}, Residual shape {res_shape_str}")
         x = jnp.concat((x, r), axis=-1)
         if self.log_dims:
-            print(f"final conv:{x.shape}")
-        return self.final_conv(x)
+            shape_str = ", ".join(map(str, x.shape))
+            logging.debug(f"Final conv input shape: {shape_str}")
+        # Apply final convolution layers
+        out = self.final_conv(x)
+        if self.log_dims:
+            out_shape_str = ", ".join(map(str, out.shape))
+            logging.debug(f"Final output shape: {out_shape_str}")
+
+        return out

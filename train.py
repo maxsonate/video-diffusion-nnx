@@ -1,5 +1,6 @@
 """Main training script for the video diffusion model."""
 
+import logging
 import argparse
 import yaml
 from pathlib import Path
@@ -12,6 +13,12 @@ from trainer import Trainer
 
 def main():
     """Parses arguments, loads config, initializes components, and starts training."""
+    # --- Configure Logging ---
+    # Set the minimum level to INFO so info messages are displayed
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+    # You can customize the format further, e.g., add timestamps:
+    # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
     # Parse command-line arguments for config file
     parser = argparse.ArgumentParser(description='Train diffusion model')
     parser.add_argument(
@@ -36,18 +43,18 @@ def main():
     config_path = Path(args.config)
 
     # Load configuration
-    print(f"Loading configuration from: {config_path}")
+    logging.info(f"Loading configuration from: {config_path}")
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
     # --- RNG Seed ---
     # Use command-line seed if provided, otherwise use config seed, otherwise default to 0
     master_seed = args.rng_seed if args.rng_seed is not None else config.get('rng_seed', 0)
-    print(f"Using master RNG seed: {master_seed}")
+    logging.info(f"Using master RNG seed: {master_seed}")
 
     # Instantiate Unet3D from config
     unet_cfg = config['unet']
-    print("Initializing Unet3D model...")
+    logging.info("Initializing Unet3D model...")
     rngs = nnx.Rngs(unet_cfg['rngs_seed'])
     unet_model = Unet3D(
         dim=unet_cfg['dim'],
@@ -59,7 +66,7 @@ def main():
 
     # Instantiate GaussianDiffusion from config
     diff_cfg = config['diffusion']
-    print("Initializing GaussianDiffusion model...")
+    logging.info("Initializing GaussianDiffusion model...")
     diffusion_model = GaussianDiffusion(
         denoise_fn=unet_model,
         image_size=diff_cfg['image_size'],
@@ -71,7 +78,7 @@ def main():
 
     # Instantiate Trainer from config
     trainer_cfg = config['trainer']
-    print("Initializing Trainer...")
+    logging.info("Initializing Trainer...")
     trainer = Trainer(
         diffusion_model=diffusion_model,
         folder=trainer_cfg['folder'],
@@ -104,9 +111,9 @@ def main():
 
     # TODO: Add loading from checkpoint before starting training
 
-    print("Starting training...")
+    logging.info("Starting training...")
     trainer.train()
-    print("Training finished.")
+    logging.info("Training finished.")
 
 
 if __name__ == '__main__':

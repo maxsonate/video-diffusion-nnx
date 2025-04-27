@@ -6,6 +6,7 @@ from einops import rearrange
 from einops_exts import check_shape
 from video_diffusion_pytorch.text import tokenize, bert_embed
 
+
 # Assuming utils.py contains relevant functions like cosine_beta_schedule, extract, etc.
 from utils import (
     cosine_beta_schedule,
