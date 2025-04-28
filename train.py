@@ -15,7 +15,7 @@ def main():
     """Parses arguments, loads config, initializes components, and starts training."""
     # --- Configure Logging ---
     # Set the minimum level to INFO so info messages are displayed
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s', force=True)
     # You can customize the format further, e.g., add timestamps:
     # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
