@@ -12,7 +12,7 @@ from einops import rearrange
 import jax
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, force=True)
 
 def main():
     """Parses arguments, loads config, initializes components, and generates samples."""
@@ -49,8 +49,14 @@ def main():
     )
 
     parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=2,
+        help='Number of videos to generate'
+    )
+    parser.add_argument(
         '--load-ema-params',
-        type=bool,
+        action='store_true',
         default=False,
         help='Whether to load EMA parameters'
     )
@@ -93,7 +99,7 @@ def main():
 
     # Create PRNG key for sampling
     key = jax.random.PRNGKey(args.seed)
-    sampled_videos = diffusion_model.sample(key)
+    sampled_videos = diffusion_model.sample(key, batch_size=args.batch_size)
     logging.info(f"Sampled {len(sampled_videos)} videos")
 
     # Rearrange dimensions and normalize to [0,255]
