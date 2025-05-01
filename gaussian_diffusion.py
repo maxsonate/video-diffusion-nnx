@@ -272,27 +272,43 @@ class GaussianDiffusion(nnx.Module):
     Returns:
       The generated samples (images/videos) with the specified shape, unnormalized to [0, 1].
     """
+    # Compute number of local devices
+    n_devices = jax.local_device_count()
     batch_size = shape[0]
-    # Split key for initial noise and the loop
+    per_device_bs = batch_size // n_devices
+    graphdef, params = nnx.split(self)
+    replicated_params = jax.device_put_replicated(params, jax.local_devices())
+
+    # Split off an initial key to generate the starting noise
     key, init_noise_key = jax.random.split(key)
-    img = jax.random.normal(key=init_noise_key, shape=shape)
 
-    # Iteratively denoise from t=num_timesteps-1 down to t=0
+    # pmapped single-step sampler
+    @jax.pmap
+    def pmapped_step(p, x, t, k):
+        model = nnx.merge(graphdef, p)
+        return model.p_sample(x, t, key=k)
+
+    # initialize with the init_noise_key
+    shape = (n_devices, 
+             per_device_bs, 
+             self.channels,
+             self.num_frames,
+             self.image_size,
+             self.image_size)
+    img = jax.random.normal(init_noise_key, shape)
+    # host-side loop with tqdm
     for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling loop', total=self.num_timesteps):
-        current_t = jnp.full((batch_size,), i, dtype=jnp.int32)
-        # Split key for this step's sample
+        # Split key for this timestep: new loop key + per-device step keys
         key, step_key = jax.random.split(key)
-        img = self.p_sample(
-            img,
-            current_t,
-            key=step_key, # Pass the key for this step
-            cond=cond,
-            cond_scale=cond_scale
-            # clip_denoised is True by default in p_sample
-        )
+        t_arr = jnp.full((n_devices, per_device_bs), i, jnp.int32)
+        step_keys = jax.random.split(step_key, num=n_devices)
+        img = pmapped_step(replicated_params, img, t_arr, step_keys)
 
-    # Unnormalize the final image from [-1, 1] to [0, 1]
-    return unnormalize_img(img)
+    # after loop unnormalize & collect
+    videos = unnormalize_img(img)  # still sharded
+    videos = jnp.array(videos).reshape(batch_size, *videos.shape[2:])
+
+    return videos
 
 
   def sample(self, key: jax.random.PRNGKey, cond=None, cond_scale: float = 1., batch_size: int = 16) -> jax.Array:
