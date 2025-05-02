@@ -429,7 +429,7 @@ def identity(t, *args, **kwargs):
   return t
 
 
-def save_checkpoint(ckpt_manager: CheckpointManager, model: nnx.Module, ema_params: PyTree, step: int):
+def save_checkpoint(ckpt_manager: CheckpointManager,model_params: PyTree, ema_params: PyTree, step: int):
     """Saves the state of an NNX model using Orbax CheckpointManager.
 
     Args:
@@ -438,12 +438,12 @@ def save_checkpoint(ckpt_manager: CheckpointManager, model: nnx.Module, ema_para
         ema_params: The Flax NNX model instance to save.
         step (int): The current training step, used as the checkpoint identifier.
     """
-    # Get the model state dictionar
-    _, state = nnx.split(model)
+    # # Get the model state dictionar
+    # _, state = nnx.split(model)
 
     # Combine states into one PyTree dict
     save_items = {
-        'model': state,
+        'model': model_params,
         'ema_params': ema_params,
     }
 

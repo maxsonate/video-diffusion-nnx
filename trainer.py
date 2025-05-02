@@ -1,3 +1,7 @@
+import os
+import time
+os.environ['JAX_TRACEBACK_FILTERING'] = 'off'
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -9,6 +13,9 @@ import torch.utils.data as data
 from itertools import cycle
 from einops import rearrange
 from torch.utils.tensorboard import SummaryWriter
+from flax.jax_utils import replicate
+from functools import partial
+from flax import struct
 
 
 # Assuming utils.py contains these functions
@@ -30,6 +37,13 @@ from datasets import MovingMNIST
 # TODO: Add EMA import and functionality
 # from ema_pytorch import EMA # Example
 
+@struct.dataclass
+class NnxTrainState:
+    # Dynamic parts (replicated across devices)
+    params: nnx.State
+    opt_state: optax.OptState
+    ema_params: nnx.State
+    # graphdef and tx removed - they will be passed as static args
 
 class Trainer:
     """Manages the training process for a video diffusion model using Flax NNX.
@@ -108,12 +122,10 @@ class Trainer:
         self.step_start_ema = step_start_ema
         self.update_ema_every = update_ema_every
         self.ema_decay = ema_decay
-        # Initialize EMA parameters as a copy of the model's initial parameters
-        _, init_params = nnx.split(diffusion_model)
-        self.ema_params = init_params
 
         # --- Core Components ---
         self.model = diffusion_model
+        self.graphdef, init_params = nnx.split(self.model) # Split once
 
         self.lr_schedule = optax.piecewise_interpolate_schedule(
             interpolate_type='cosine',
@@ -123,11 +135,12 @@ class Trainer:
                 lr_decay_start_step + lr_decay_steps:  lr_decay_coeff  # then cosine‐interpolate down to init*coeff
             }
         )
-        self.optimizer = nnx.Optimizer(
-            self.model,
-            optax.adam(self.lr_schedule)    # ← pass the function, not schedule(self.step)
-        )
-        
+        # Create the Optax transformer (optimizer logic)
+        self.tx = optax.adam(self.lr_schedule)
+
+        # Initialize parameters, optimizer state, and EMA state
+        init_opt_state = self.tx.init(init_params)
+        init_ema_params = jax.tree_util.tree_map(lambda x: x, init_params)
 
         # --- Training Configuration ---
         self.train_num_steps = train_num_steps
@@ -135,6 +148,34 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.use_path_as_cond = use_path_as_cond
         self.gradient_accumulate_every = gradient_accumulate_every # TODO: Implement gradient accumulation
+
+        # --- Device Setup ---
+        self.n_devices = jax.local_device_count()
+        devices = jax.local_devices()
+        assert self.batch_size % self.n_devices == 0, "batch_size must be divisible by number of devices"
+        self.per_device_bs = self.batch_size // self.n_devices
+
+        # --- Create and Replicate Train State ---
+        # Create the initial state object on the host (only dynamic parts)
+        host_state = NnxTrainState(
+            params=init_params,
+            opt_state=init_opt_state,
+            ema_params=init_ema_params
+            # graphdef and tx are kept as self.graphdef, self.tx
+        )
+        # Replicate the potentially loaded host_state (or initial if loading failed)
+        self.state = jax.device_put_replicated(host_state, devices)
+
+        # # --- Log shapes after replication ---
+        # logging.info("Checking shapes of replicated state in __init__...")
+        # def print_shape_init(path, x):
+        #     if isinstance(x, jax.Array):
+        #         logging.info(f"  Path: {jax.tree_util.keystr(path)} | Leaf shape: {x.shape}")
+        #     # else:
+        #     #    logging.info(f"  Path: {jax.tree_util.keystr(path)} | Type: {type(x)}") # Optional: log non-arrays
+        # jax.tree_util.tree_map_with_path(print_shape_init, self.state)
+        # logging.info(f"Expected leading dimension: {self.n_devices}")
+        # # ----------------------------------
 
         # --- Dataset and Dataloader ---
         self.image_size = diffusion_model.image_size
@@ -151,7 +192,8 @@ class Trainer:
         num_samples = len(self.ds)
         logging.info(f"Found {num_samples} sequences in dataset.")
         assert num_samples > 0, "Dataset is empty. Check path and format."
-        self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True, pin_memory=True))
+        # Add drop_last=True to ensure all batches have the expected size
+        self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True, pin_memory=True, drop_last=True))
 
         # --- Results and Checkpointing ---
         # Resolve results_folder to an absolute path
@@ -178,18 +220,117 @@ class Trainer:
         self.step = resume_training_step
         if self.step > 0:
             logging.info(f"Attempting to resume training from step {self.step}")
-            # TODO: Implement checkpoint loading using load_checkpoint utility
+            # Adapt checkpoint loading for NnxTrainState
             try:
-                self.model, self.ema_params = load_checkpoint(self.model, self.step, self.checkpoint_dir_path, ckpt_manager=self.ckpt_manager, load_ema_params=False)
+                model, ema_params = load_checkpoint(self.model, self.step, self.checkpoint_dir_path, self.ckpt_manager) 
+                if model is not None and ema_params is not None:
+                   host_state = NnxTrainState(
+                       params=nnx.split(model)[1],
+                       opt_state=init_opt_state,
+                       ema_params=ema_params
+                   ) # Update host_state before replication
+                   logging.info(f"Successfully loaded checkpoint state for step {self.step}")
+                else:
+                   logging.warning(f"Checkpoint loading function returned None for step {self.step}.")
+                   self.step = 0
 
-                # TODO: Load optimizer state as well
-                logging.info(f"Successfully loaded checkpoint from step {self.step}")
             except FileNotFoundError:
                 logging.warning(f"Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}. Starting from step 0.")
                 self.step = 0
+            # except Exception as e:
+            #    logging.error(f"Error loading checkpoint for step {self.step}: {e}. Starting from step 0.")
+            #    self.step = 0
+
+        # Replicate the potentially loaded host_state (or initial if loading failed)
+        self.state = jax.device_put_replicated(host_state, devices)
+
+        # # --- Log shapes after replication ---
+        # logging.info("Checking shapes of replicated state in __init__...")
+        # def print_shape_init(path, x):
+        #     if isinstance(x, jax.Array):
+        #         logging.info(f"  Path: {jax.tree_util.keystr(path)} | Leaf shape: {x.shape}")
+        #     # else:
+        #     #    logging.info(f"  Path: {jax.tree_util.keystr(path)} | Type: {type(x)}") # Optional: log non-arrays
+        # jax.tree_util.tree_map_with_path(print_shape_init, self.state)
+        # logging.info(f"Expected leading dimension: {self.n_devices}")
+        # # ----------------------------------
 
         # --- Visualization (Not Implemented) ---
         self.add_loss_plot = add_loss_plot
+
+        # define a pmapped train‐step
+        # Pass graphdef, tx, step, and specific config values needed inside the step as static args
+        @partial(jax.pmap, axis_name='batch',
+                 # state(0), batch_data(1), key(2), step(3), step_start_ema(7), update_ema_every(8), ema_decay(9) are dynamic
+                 # graphdef(4), tx(5), use_path_as_cond(6) are static
+                 static_broadcasted_argnums=(4, 5, 6))
+        def _pmap_train_step(state: NnxTrainState, batch_data, key, step: int,
+                             graphdef: nnx.GraphDef,
+                             tx: optax.GradientTransformation,
+                             use_path_as_cond: bool,
+                             step_start_ema: int,
+                             update_ema_every: int,
+                             ema_decay: float):
+            """Performs a single training step on each device."""
+
+            # 'step' is now a static argument
+            def loss_fn(params):
+                # Use the passed static graphdef
+                model_for_loss = nnx.merge(graphdef, params)
+
+                # Use the passed-in static arg 'use_path_as_cond'
+                if use_path_as_cond:
+                    video_data, cond_data = batch_data
+                    loss = model_for_loss(
+                        video_data,
+                        key=key,
+                        cond=cond_data,
+                        prob_focus_present=0., # Pass these if needed
+                        focus_present_mask=None
+                    )
+                else:
+                    loss = model_for_loss(
+                        batch_data,
+                        key=key,
+                        prob_focus_present=0.,
+                        focus_present_mask=None
+                    )
+                return loss
+
+            # Calculate loss and gradients using the state's params
+            (loss, grads) = jax.value_and_grad(loss_fn)(state.params)
+
+            # Average gradients and loss across devices
+            grads = jax.lax.pmean(grads, axis_name='batch')
+            loss = jax.lax.pmean(loss, axis_name='batch')
+
+            # Apply optimizer updates using the passed static tx and state's opt_state
+            updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
+            new_params = optax.apply_updates(state.params, updates)
+
+            # --- EMA Update ---
+            # Access ema_decay etc. from passed-in static args
+            # 'step' is static
+            do_ema = jnp.logical_and(step >= step_start_ema,
+                                     (step % update_ema_every) == 0)
+            new_ema_params = jax.lax.cond(
+                do_ema,
+                # Use the passed-in static arg 'ema_decay'
+                lambda _: jax.tree_util.tree_map(lambda ema_p, p: ema_decay * ema_p + (1 - ema_decay) * p,
+                                       state.ema_params, new_params),
+                lambda _: state.ema_params,
+                operand=None
+            )
+
+            # Return the updated state (only dynamic parts) and the scalar loss
+            new_state = state.replace(
+                params=new_params,
+                opt_state=new_opt_state,
+                ema_params=new_ema_params
+            )
+            return new_state, loss
+
+        self.p_train_step = _pmap_train_step
 
     def sample_batch(self, batch_size):
         """(Placeholder) Sample a single batch of videos.
@@ -207,7 +348,7 @@ class Trainer:
         shape = (batch_size, self.model.channels, self.model.num_frames, self.image_size, self.image_size)
         return jnp.zeros(shape)
 
-    def train(self, prob_focus_present: float = 0., focus_present_mask = None, log_fn = noop):
+    def train_pmap(self, prob_focus_present: float = 0., focus_present_mask = None, log_fn = noop):
         """Runs the main training loop.
 
         Args:
@@ -219,31 +360,6 @@ class Trainer:
         """
         assert callable(log_fn)
         logging.info(f"Starting training loop from step {self.step}...")
-
-        # --- Loss Function Definition ---
-        # Defined within train to capture self.use_path_as_cond easily
-        def compute_loss(model, batch_data, key, prob_focus_present, focus_present_mask):
-            if self.use_path_as_cond:
-                # Assuming batch_data is a tuple (video, condition)
-                video_data, cond_data = batch_data
-                loss = model(
-                    video_data,
-                    key=key,
-                    cond=cond_data,
-                    prob_focus_present=prob_focus_present,
-                    focus_present_mask=focus_present_mask
-                )
-            else:
-                # Assuming batch_data is just the video tensor
-                loss = model(
-                    batch_data,
-                    key=key,
-                    prob_focus_present=prob_focus_present,
-                    focus_present_mask=focus_present_mask
-                )
-            return loss
-
-        grad_fn = nnx.value_and_grad(compute_loss)
 
         # --- Training Loop ---
         losses = []
@@ -270,60 +386,86 @@ class Trainer:
                  # logging.warning(f"Input data max is {jnp.max(batch_data)}. Performing simple max normalization.")
                  batch_data = batch_data / jnp.max(batch_data)
 
-            # --- Gradient Calculation and Optimization ---
-            # TODO: Implement gradient accumulation
-            # TODO: Implement AMP if feasible for JAX/Flax
-            loss, grads = grad_fn(
-                self.model,
-                batch_data,
-                step_key,
-                prob_focus_present,
-                focus_present_mask,
+            # --- Shard Data ---
+            # Reshape data with leading device dimension
+            sharded_batch = batch_data.reshape(
+                (self.n_devices, self.per_device_bs, *batch_data.shape[1:])
             )
+            # The explicit device_put_sharded call is removed
 
-            # Gradient Clipping
-            if self.max_grad_norm is not None:
-                # grads, l2_norm = clip_grad_norm(grads, max_grad_norm=self.max_grad_norm)
-                grads, l2_norm = clip_grad_norm_with_tb_logging(grads, max_grad_norm=self.max_grad_norm, tb_writer=self.writer, step=self.step)
-                self.writer.add_scalar('grads/pre_clip_l2_norm', float(l2_norm), self.step)
+            # --- Keys ---
+            keys = jax.random.split(step_key, self.n_devices)
 
-            self.optimizer.update(grads)
+            # --- Prepare Dynamic Scalar Arguments for pmap ---
+            # Convert Python scalars to JAX arrays and replicate across devices
+            # These arguments are dynamic but the same for all devices.
+            step_jax = jax.device_put_replicated(jnp.array(self.step, dtype=jnp.int32), devices=jax.local_devices())
+            step_start_ema_jax = jax.device_put_replicated(jnp.array(self.step_start_ema, dtype=jnp.int32), devices=jax.local_devices())
+            update_ema_every_jax = jax.device_put_replicated(jnp.array(self.update_ema_every, dtype=jnp.int32), devices=jax.local_devices())
+            ema_decay_jax = jax.device_put_replicated(jnp.array(self.ema_decay, dtype=jnp.float32), devices=jax.local_devices())
+
+            # --- Log shapes before pmap call ---
+            logging.debug(f"Step {self.step}: Shapes before pmap call:")
+            logging.debug(f"  sharded_batch shape: {sharded_batch.shape}")
+            logging.debug(f"  keys shape: {keys.shape}")
+            logging.debug(f"  step type: {type(self.step)}")
+            # logging.debug("  Checking self.state shapes:")
+            # def log_state_shape_loop(path, x):
+            #     if isinstance(x, jax.Array):
+            #         logging.debug(f"    Path: {jax.tree_util.keystr(path)} | Leaf shape: {x.shape}")
+            # jax.tree_util.tree_map_with_path(log_state_shape_loop, self.state)
+            # ------------------------------------
+
+            # --- Execute PMapped Step ---
+            # Pass self.state and the required static values explicitly
+
+            start_time = time.time()
+            self.state, loss_val = self.p_train_step(
+                self.state,           # Arg 0 (replicated state)
+                sharded_batch,       # Arg 1 (sharded data)
+                keys,                # Arg 2 (sharded keys)
+                # Dynamic args (non-static) start here
+                step_jax,           # Arg 3 (step) - Now replicated JAX array
+                self.graphdef,       # Arg 4: graphdef (static)
+                self.tx,             # Arg 5 (tx)
+                self.use_path_as_cond,# Arg 6 (use_path_as_cond)
+                step_start_ema_jax, # Arg 7 (step_start_ema) - Now replicated JAX array
+                update_ema_every_jax,# Arg 8 (update_ema_every) - Now replicated JAX array
+                ema_decay_jax       # Arg 9 (ema_decay) - Now replicated JAX array
+            )
+            end_time = time.time()
+            
+            self.writer.add_scalar('step_time', end_time - start_time, self.step)
 
             # --- Logging ---
-            current_loss = float(np.array(loss))
+            # loss_val is the averaged scalar loss, potentially still on device
+            # Use jax.device_get to bring it to the host CPU before converting
+            current_loss = float(jax.device_get(loss_val)[0])
             losses.append(current_loss)
             logging.info(f"Step: {self.step}/{self.train_num_steps} | Loss: {current_loss:.4f}")
-            log_fn({'loss': current_loss, 'step': self.step})
+            log_fn({'loss': current_loss, 'step': self.step}) # Your logging callback
 
             # --- TensorBoard Logging ---
             self.writer.add_scalar('loss/train', current_loss, self.step)
-            self.writer.add_scalar('lr/train', self.lr_schedule(self.step), self.step)
-
-            
-
-            # --- EMA Update ---
-            if self.step >= self.step_start_ema and self.step % self.update_ema_every == 0:
-                # Extract current model parameters
-                _, curr_params = nnx.split(self.model)
-                # Update EMA parameters
-                self.ema_params = jax.tree_map(
-                    lambda ema_p, p: self.ema_decay * ema_p + (1 - self.ema_decay) * p,
-                    self.ema_params, curr_params
-                )
-                # Reduce frequency of EMA update logging
-                if self.step % (self.update_ema_every * 10) == 0: # Log every 10 EMA updates
-                    logging.debug(f"Step: {self.step} | Updated EMA parameters")
+            # Get LR from the schedule
+            current_lr = self.lr_schedule(self.step)
+            self.writer.add_scalar('lr/train', current_lr, self.step)
 
             # --- Checkpointing ---
             if self.step > 0 and self.step % self.checkpoint_every_steps == 0:
                 logging.info(f"Step: {self.step} | Saving checkpoint...")
                 try:
-                    save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.step)
-                    # TODO: Save optimizer state as well
+                    # Get state from device 0 to save
+                    state_to_save = jax.device_get(jax.tree.map(lambda x: x[0], self.state))
+                    # Adapt save_checkpoint to handle NnxTrainState
+                    # save_checkpoint_state(self.ckpt_manager, state_to_save, self.step) # Example
+                    logging.warning("Checkpoint saving needs adaptation for NnxTrainState!")
+                    # Placeholder using old save for ema_params until adapted
+                    save_checkpoint(self.ckpt_manager, state_to_save.params, state_to_save.ema_params, self.step)
                 except Exception as e:
                     logging.error(f"Error saving checkpoint at step {self.step}: {e}")
 
-            # --- Sampling (Removed) ---
+            # --- Sampling (Needs Adaptation) ---
             # if self.step != 0 and self.step % self.save_and_sample_every == 0:
             #     milestone = self.step // self.save_and_sample_every
             #     print(f"Step: {self.step} | Generating sample batch at milestone {milestone}...")
@@ -339,7 +481,13 @@ class Trainer:
         # Save final checkpoint
         logging.info("Saving final checkpoint...")
         try:
-            save_checkpoint(self.ckpt_manager, self.model, self.ema_params, self.step)
+            # Get final state from device 0
+            final_state_to_save = jax.device_get(jax.tree.map(lambda x: x[0], self.state))
+            # Adapt save_checkpoint
+            # save_checkpoint_state(self.ckpt_manager, final_state_to_save, self.step) # Example
+            logging.warning("Final checkpoint saving needs adaptation for NnxTrainState!")
+            # Placeholder using old save for ema_params until adapted
+            save_checkpoint(self.ckpt_manager, final_state_to_save.params, final_state_to_save.ema_params, self.step)
         except Exception as e:
             logging.error(f"Error saving final checkpoint at step {self.step}: {e}")
 
@@ -347,9 +495,3 @@ class Trainer:
         self.writer.close()
         logging.info(f"TensorBoard logs saved to: {self.tensorboard_dir}")
         logging.info(f"View TensorBoard with: tensorboard --logdir={self.tensorboard_dir}")
-
-    # --- Sampling Method (Removed - Placeholder left above) ---
-    # def generate_samples(self, milestone: int):
-    #     """Generates a batch of samples and saves them as a GIF."""
-    #     # ... (Implementation using sample_batch, rearrange, video_array_to_gif) ...
-    #     pass
