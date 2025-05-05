@@ -10,4 +10,5 @@ einops-exts # Used in gaussian_diffusion.py
 PyYAML
 tqdm
 Pillow # For PIL
-pytest # For running tests 
+pytest # For running tests
+video_diffusion_pytorch 
