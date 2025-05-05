@@ -11,4 +11,5 @@ PyYAML
 tqdm
 Pillow # For PIL
 pytest # For running tests
-video_diffusion_pytorch 
+video_diffusion_pytorch
+tensorboard # For logging training metrics and visualization 
