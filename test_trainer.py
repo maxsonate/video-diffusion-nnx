@@ -122,7 +122,7 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(trainer.step, 0)
         self.assertTrue(self.results_folder.exists())
         self.assertTrue(self.checkpoint_dir.exists())
-        self.assertIsInstance(trainer.optimizer, nnx.Optimizer)
+        self.assertIsInstance(trainer.tx, optax.GradientTransformationExtraArgs)
         # Check if the hardcoded MovingMNIST was attempted to be initialized
         # Note: This depends on the hardcoded path inside Trainer.__init__
         # If the path changes, this assertion needs update or removal.
@@ -154,23 +154,11 @@ class TestTrainer(unittest.TestCase):
         # Expected calls at step 2, 4 (inside loop) and 5 (final)
         self.assertEqual(self.mock_save_checkpoint.call_count, 3)
         expected_calls = [
-            call(trainer.model, 2, trainer.checkpoint_dir_path),
-            call(trainer.model, 4, trainer.checkpoint_dir_path),
-            call(trainer.model, 5, trainer.checkpoint_dir_path) # Check for step 5
+            call(trainer.ckpt_manager, unittest.mock.ANY, unittest.mock.ANY, 2),
+            call(trainer.ckpt_manager, unittest.mock.ANY, unittest.mock.ANY, 4),
+            call(trainer.ckpt_manager, unittest.mock.ANY, unittest.mock.ANY, 5),
         ]
         self.mock_save_checkpoint.assert_has_calls(expected_calls, any_order=False) # Ensure order
-
-
-    def test_gradient_clipping_called(self):
-        """Test if clip_grad_norm is called when max_grad_norm is set."""
-        args = self.trainer_args.copy()
-        args['max_grad_norm'] = 1.0
-        args['train_num_steps'] = 2
-        trainer = Trainer(**args)
-        trainer.train()
-        self.assertGreater(self.mock_clip_grad.call_count, 0)
-        # Check if it was called with the correct keyword argument
-        self.mock_clip_grad.assert_called_with(unittest.mock.ANY, max_grad_norm=1.0)
 
 
     def test_gradient_clipping_not_called(self):

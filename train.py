@@ -112,7 +112,7 @@ def main():
     # TODO: Add loading from checkpoint before starting training
 
     logging.info("Starting training...")
-    trainer.train_pmap()
+    trainer.train()
     logging.info("Training finished.")
 
 

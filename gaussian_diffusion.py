@@ -5,7 +5,10 @@ from tqdm import tqdm
 from einops import rearrange
 from einops_exts import check_shape
 from video_diffusion_pytorch.text import tokenize, bert_embed
-
+from jax.experimental.pjit import pjit
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
+from functools import partial
 
 # Assuming utils.py contains relevant functions like cosine_beta_schedule, extract, etc.
 from utils import (
@@ -282,15 +285,23 @@ class GaussianDiffusion(nnx.Module):
     # Split off an initial key to generate the starting noise
     key, init_noise_key = jax.random.split(key)
 
-    # pmapped single-step sampler
-    @jax.pmap
-    def pmapped_step(p, x, t, k):
+    mesh = Mesh(mesh_utils.create_device_mesh((n_devices,)), axis_names=('data',))
+
+    @partial(pjit,
+      in_shardings=(
+        NamedSharding(mesh, P()),
+        NamedSharding(mesh, P('data')),
+        NamedSharding(mesh, P('data')),
+        NamedSharding(mesh, P('data'))
+      ),
+      out_shardings=NamedSharding(mesh, P('data'))
+    )
+    def pjit_step(p, x, t, k):
         model = nnx.merge(graphdef, p)
         return model.p_sample(x, t, key=k)
 
     # initialize with the init_noise_key
-    shape = (n_devices, 
-             per_device_bs, 
+    shape = (batch_size, 
              self.channels,
              self.num_frames,
              self.image_size,
@@ -300,14 +311,12 @@ class GaussianDiffusion(nnx.Module):
     for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling loop', total=self.num_timesteps):
         # Split key for this timestep: new loop key + per-device step keys
         key, step_key = jax.random.split(key)
-        t_arr = jnp.full((n_devices, per_device_bs), i, jnp.int32)
+        t_arr = jnp.full((batch_size,), i, jnp.int32)
         step_keys = jax.random.split(step_key, num=n_devices)
-        img = pmapped_step(replicated_params, img, t_arr, step_keys)
+        img = pjit_step(params, img, t_arr, step_key)
 
-    # after loop unnormalize & collect
+    # after loop unnormalize
     videos = unnormalize_img(img)  # still sharded
-    videos = jnp.array(videos).reshape(batch_size, *videos.shape[2:])
-
     return videos
 
 
@@ -405,7 +414,6 @@ class GaussianDiffusion(nnx.Module):
     if noise is None:
         assert key is not None, "A PRNGKey must be provided to q_sample if noise is not."
         noise = jax.random.normal(key, shape=x_start.shape)
-
     return (
         extract(self.sqrt_alphas_cumprod.value, t, x_start.shape) * x_start +
         extract(self.sqrt_one_minus_alphas_cumprod.value, t, x_start.shape) * noise

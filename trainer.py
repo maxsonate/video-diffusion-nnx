@@ -11,11 +11,13 @@ from flax import nnx
 from pathlib import Path
 import torch.utils.data as data
 from itertools import cycle
-from einops import rearrange
 from torch.utils.tensorboard import SummaryWriter
-from flax.jax_utils import replicate
+from jax.sharding import Mesh, PartitionSpec as P
+from jax.experimental import mesh_utils
 from functools import partial
 from flax import struct
+
+from jax.experimental.pjit import pjit
 
 
 # Assuming utils.py contains these functions
@@ -26,11 +28,11 @@ from utils import (
     save_checkpoint,
     load_checkpoint,
     clip_grad_norm,
-    clip_grad_norm_with_tb_logging,
+    # clip_grad_norm_with_tb_logging, # Removed
     # cycle # Imported from itertools
 )
 import orbax.checkpoint as ocp
-from orbax.checkpoint import CheckpointManager, CheckpointManagerOptions, args as ocp_args
+from orbax.checkpoint import CheckpointManager, CheckpointManagerOptions #, args as ocp_args # Removed
 from typing import Optional
 from datasets import MovingMNIST
 
@@ -39,7 +41,7 @@ from datasets import MovingMNIST
 
 @struct.dataclass
 class NnxTrainState:
-    # Dynamic parts (replicated across devices)
+    # Dynamic parts (potentially sharded)
     params: nnx.State
     opt_state: optax.OptState
     ema_params: nnx.State
@@ -77,7 +79,7 @@ class Trainer:
         max_to_keep (int | None, optional): Maximum number of checkpoints to keep. If None, all checkpoints are kept. Defaults to None.
         lr_decay_start_step (int, optional): Step number to start learning rate decay. Defaults to 0.
         lr_decay_steps (int, optional): Number of steps over which to decay learning rate. Defaults to 0.
-        lr_decay_coeff (float, optional): Coefficient for learning rate decay. Defaults to 0.1.
+        lr_decay_coeff (float, optional): Coefficient for learning rate decay. Defaults to 1.0.
         rng_seed (int, optional): Master PRNG seed for reproducibility. Defaults to 0.
     """
     def __init__(
@@ -156,6 +158,9 @@ class Trainer:
         self.per_device_bs = self.batch_size // self.n_devices
 
         # --- Create and Replicate Train State ---
+        # Create Mesh
+        self.mesh = Mesh(mesh_utils.create_device_mesh((self.n_devices,)), axis_names=('data',))
+
         # Create the initial state object on the host (only dynamic parts)
         host_state = NnxTrainState(
             params=init_params,
@@ -163,20 +168,8 @@ class Trainer:
             ema_params=init_ema_params
             # graphdef and tx are kept as self.graphdef, self.tx
         )
-        # Replicate the potentially loaded host_state (or initial if loading failed)
-        self.state = jax.device_put_replicated(host_state, devices)
 
-        # # --- Log shapes after replication ---
-        # logging.info("Checking shapes of replicated state in __init__...")
-        # def print_shape_init(path, x):
-        #     if isinstance(x, jax.Array):
-        #         logging.info(f"  Path: {jax.tree_util.keystr(path)} | Leaf shape: {x.shape}")
-        #     # else:
-        #     #    logging.info(f"  Path: {jax.tree_util.keystr(path)} | Type: {type(x)}") # Optional: log non-arrays
-        # jax.tree_util.tree_map_with_path(print_shape_init, self.state)
-        # logging.info(f"Expected leading dimension: {self.n_devices}")
-        # # ----------------------------------
-
+        self.state = host_state
         # --- Dataset and Dataloader ---
         self.image_size = diffusion_model.image_size
         model_num_frames = diffusion_model.num_frames
@@ -233,44 +226,41 @@ class Trainer:
                 else:
                    logging.warning(f"Checkpoint loading function returned None for step {self.step}.")
                    self.step = 0
-
             except FileNotFoundError:
-                logging.warning(f"Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}. Starting from step 0.")
+                logging.warning(f"Checkpoint for step {self.step} not found at {self.checkpoint_dir_path}.")
                 self.step = 0
-            # except Exception as e:
-            #    logging.error(f"Error loading checkpoint for step {self.step}: {e}. Starting from step 0.")
-            #    self.step = 0
 
-        # Replicate the potentially loaded host_state (or initial if loading failed)
-        self.state = jax.device_put_replicated(host_state, devices)
-
-        # # --- Log shapes after replication ---
-        # logging.info("Checking shapes of replicated state in __init__...")
-        # def print_shape_init(path, x):
-        #     if isinstance(x, jax.Array):
-        #         logging.info(f"  Path: {jax.tree_util.keystr(path)} | Leaf shape: {x.shape}")
-        #     # else:
-        #     #    logging.info(f"  Path: {jax.tree_util.keystr(path)} | Type: {type(x)}") # Optional: log non-arrays
-        # jax.tree_util.tree_map_with_path(print_shape_init, self.state)
-        # logging.info(f"Expected leading dimension: {self.n_devices}")
-        # # ----------------------------------
-
+            self.state = host_state
         # --- Visualization (Not Implemented) ---
         self.add_loss_plot = add_loss_plot
 
-        # define a pmapped train‐step
-        # Pass graphdef, tx, step, and specific config values needed inside the step as static args
-        @partial(jax.pmap, axis_name='batch',
-                 # state(0), batch_data(1), key(2), step(3), step_start_ema(7), update_ema_every(8), ema_decay(9) are dynamic
-                 # graphdef(4), tx(5), use_path_as_cond(6) are static
-                 static_broadcasted_argnums=(4, 5, 6))
-        def _pmap_train_step(state: NnxTrainState, batch_data, key, step: int,
-                             graphdef: nnx.GraphDef,
-                             tx: optax.GradientTransformation,
-                             use_path_as_cond: bool,
-                             step_start_ema: int,
-                             update_ema_every: int,
-                             ema_decay: float):
+        # Define pjit'd train step with shardings
+        @partial(pjit,
+                 # Define shardings for inputs and outputs
+                 # Use the Trainer's mesh for all sharding specifications
+                 in_shardings=(
+                     jax.sharding.NamedSharding(self.mesh, P()),         # state (replicated)
+                     jax.sharding.NamedSharding(self.mesh, P('data')),  # batch_data (sharded along 'data')
+                     jax.sharding.NamedSharding(self.mesh, P()),         # key (replicated)
+                     jax.sharding.NamedSharding(self.mesh, P()),         # step (replicated)
+                     jax.sharding.NamedSharding(self.mesh, P()),         # step_start_ema (replicated)
+                     jax.sharding.NamedSharding(self.mesh, P()),         # update_ema_every (replicated)
+                     jax.sharding.NamedSharding(self.mesh, P()),         # ema_decay (replicated)
+                 ),
+                 out_shardings=(
+                     jax.sharding.NamedSharding(self.mesh, P()),         # new_state (replicated)
+                     jax.sharding.NamedSharding(self.mesh, P())          # loss (replicated)
+                 ),
+                 # Specify arguments that are static across calls (affect compilation)
+                 static_argnums=(4, 5, 6) # graphdef, tx, use_path_as_cond
+                )
+        def _pjit_train_step(state: NnxTrainState, batch_data, key, step: int,
+                              graphdef: nnx.GraphDef,
+                              tx: optax.GradientTransformation,
+                              use_path_as_cond: bool,
+                              step_start_ema: int,
+                              update_ema_every: int,
+                              ema_decay: float):
             """Performs a single training step on each device."""
 
             # 'step' is now a static argument
@@ -300,9 +290,8 @@ class Trainer:
             # Calculate loss and gradients using the state's params
             (loss, grads) = jax.value_and_grad(loss_fn)(state.params)
 
-            # Average gradients and loss across devices
-            grads = jax.lax.pmean(grads, axis_name='batch')
-            loss = jax.lax.pmean(loss, axis_name='batch')
+            # Gradients and loss are implicitly averaged/summed by pjit based on operations
+            # (e.g., mean reduction in loss_fn)
 
             # Apply optimizer updates using the passed static tx and state's opt_state
             updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
@@ -330,7 +319,7 @@ class Trainer:
             )
             return new_state, loss
 
-        self.p_train_step = _pmap_train_step
+        self.p_train_step = _pjit_train_step
 
     def sample_batch(self, batch_size):
         """(Placeholder) Sample a single batch of videos.
@@ -348,7 +337,7 @@ class Trainer:
         shape = (batch_size, self.model.channels, self.model.num_frames, self.image_size, self.image_size)
         return jnp.zeros(shape)
 
-    def train_pmap(self, prob_focus_present: float = 0., focus_present_mask = None, log_fn = noop):
+    def train(self, prob_focus_present: float = 0., focus_present_mask = None, log_fn = noop):
         """Runs the main training loop.
 
         Args:
@@ -379,60 +368,26 @@ class Trainer:
                 batch_torch = next(self.dl)
                 batch_data = jnp.array(batch_torch.detach().cpu().numpy())
 
-            # Simple normalization (adjust based on actual dataset range)
-            if jnp.issubdtype(batch_data.dtype, jnp.integer):
-                batch_data = batch_data.astype(jnp.float32) / 255.0
-            elif jnp.max(batch_data) > 1.0:
-                 # logging.warning(f"Input data max is {jnp.max(batch_data)}. Performing simple max normalization.")
-                 batch_data = batch_data / jnp.max(batch_data)
 
-            # --- Shard Data ---
-            # Reshape data with leading device dimension
-            sharded_batch = batch_data.reshape(
-                (self.n_devices, self.per_device_bs, *batch_data.shape[1:])
-            )
-            # The explicit device_put_sharded call is removed
-
-            # --- Keys ---
-            keys = jax.random.split(step_key, self.n_devices)
-
-            # --- Prepare Dynamic Scalar Arguments for pmap ---
-            # Convert Python scalars to JAX arrays and replicate across devices
-            # These arguments are dynamic but the same for all devices.
-            step_jax = jax.device_put_replicated(jnp.array(self.step, dtype=jnp.int32), devices=jax.local_devices())
-            step_start_ema_jax = jax.device_put_replicated(jnp.array(self.step_start_ema, dtype=jnp.int32), devices=jax.local_devices())
-            update_ema_every_jax = jax.device_put_replicated(jnp.array(self.update_ema_every, dtype=jnp.int32), devices=jax.local_devices())
-            ema_decay_jax = jax.device_put_replicated(jnp.array(self.ema_decay, dtype=jnp.float32), devices=jax.local_devices())
-
-            # --- Log shapes before pmap call ---
-            logging.debug(f"Step {self.step}: Shapes before pmap call:")
-            logging.debug(f"  sharded_batch shape: {sharded_batch.shape}")
-            logging.debug(f"  keys shape: {keys.shape}")
-            logging.debug(f"  step type: {type(self.step)}")
-            # logging.debug("  Checking self.state shapes:")
-            # def log_state_shape_loop(path, x):
-            #     if isinstance(x, jax.Array):
-            #         logging.debug(f"    Path: {jax.tree_util.keystr(path)} | Leaf shape: {x.shape}")
-            # jax.tree_util.tree_map_with_path(log_state_shape_loop, self.state)
-            # ------------------------------------
-
-            # --- Execute PMapped Step ---
+            # --- Execute Pjit'd Step ---
             # Pass self.state and the required static values explicitly
-
+            # Call the pjit'd function with explicit device shardings (no mesh context required)
             start_time = time.time()
+            # No need for mesh context with SingleDeviceSharding
             self.state, loss_val = self.p_train_step(
                 self.state,           # Arg 0 (replicated state)
-                sharded_batch,       # Arg 1 (sharded data)
-                keys,                # Arg 2 (sharded keys)
+                batch_data,          # Arg 1 (unsharded host data - pjit handles sharding)
+                step_key,           # Arg 2 (replicated key)
                 # Dynamic args (non-static) start here
-                step_jax,           # Arg 3 (step) - Now replicated JAX array
+                self.step,           # Arg 3 (step) - Scalar passed directly
                 self.graphdef,       # Arg 4: graphdef (static)
                 self.tx,             # Arg 5 (tx)
                 self.use_path_as_cond,# Arg 6 (use_path_as_cond)
-                step_start_ema_jax, # Arg 7 (step_start_ema) - Now replicated JAX array
-                update_ema_every_jax,# Arg 8 (update_ema_every) - Now replicated JAX array
-                ema_decay_jax       # Arg 9 (ema_decay) - Now replicated JAX array
+                self.step_start_ema, # Arg 7 (step_start_ema) - Scalar
+                self.update_ema_every,# Arg 8 (update_ema_every) - Scalar
+                self.ema_decay       # Arg 9 (ema_decay) - Scalar
             )
+
             end_time = time.time()
             
             self.writer.add_scalar('step_time', end_time - start_time, self.step)
@@ -440,7 +395,7 @@ class Trainer:
             # --- Logging ---
             # loss_val is the averaged scalar loss, potentially still on device
             # Use jax.device_get to bring it to the host CPU before converting
-            current_loss = float(jax.device_get(loss_val)[0])
+            current_loss = float(jax.device_get(loss_val))
             losses.append(current_loss)
             logging.info(f"Step: {self.step}/{self.train_num_steps} | Loss: {current_loss:.4f}")
             log_fn({'loss': current_loss, 'step': self.step}) # Your logging callback
@@ -455,11 +410,9 @@ class Trainer:
             if self.step > 0 and self.step % self.checkpoint_every_steps == 0:
                 logging.info(f"Step: {self.step} | Saving checkpoint...")
                 try:
-                    # Get state from device 0 to save
-                    state_to_save = jax.device_get(jax.tree.map(lambda x: x[0], self.state))
-                    # Adapt save_checkpoint to handle NnxTrainState
-                    # save_checkpoint_state(self.ckpt_manager, state_to_save, self.step) # Example
-                    logging.warning("Checkpoint saving needs adaptation for NnxTrainState!")
+                    # Get state from device to save. For pjit-replicated state, jax.device_get is sufficient.
+                    state_to_save = jax.device_get(self.state)
+                    logging.warning("Checkpoint saving needs adaptation for NnxTrainState!") # This warning remains as per original
                     # Placeholder using old save for ema_params until adapted
                     save_checkpoint(self.ckpt_manager, state_to_save.params, state_to_save.ema_params, self.step)
                 except Exception as e:
@@ -481,11 +434,9 @@ class Trainer:
         # Save final checkpoint
         logging.info("Saving final checkpoint...")
         try:
-            # Get final state from device 0
-            final_state_to_save = jax.device_get(jax.tree.map(lambda x: x[0], self.state))
-            # Adapt save_checkpoint
-            # save_checkpoint_state(self.ckpt_manager, final_state_to_save, self.step) # Example
-            logging.warning("Final checkpoint saving needs adaptation for NnxTrainState!")
+            # Get final state from device. For pjit-replicated state, jax.device_get is sufficient.
+            final_state_to_save = jax.device_get(self.state)
+            logging.warning("Final checkpoint saving needs adaptation for NnxTrainState!") # This warning remains as per original
             # Placeholder using old save for ema_params until adapted
             save_checkpoint(self.ckpt_manager, final_state_to_save.params, final_state_to_save.ema_params, self.step)
         except Exception as e:
