@@ -16,6 +16,8 @@ from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental import mesh_utils
 from functools import partial
 from flax import struct
+from jax.profiler import start_trace, stop_trace
+import jax.profiler
 
 from jax.experimental.pjit import pjit
 
@@ -81,6 +83,7 @@ class Trainer:
         lr_decay_steps (int, optional): Number of steps over which to decay learning rate. Defaults to 0.
         lr_decay_coeff (float, optional): Coefficient for learning rate decay. Defaults to 1.0.
         rng_seed (int, optional): Master PRNG seed for reproducibility. Defaults to 0.
+        profile_flush_interval_steps (int, optional): Frequency (in steps) for flushing JAX profiler file traces. Defaults to 1000.
     """
     def __init__(
         self,
@@ -113,12 +116,14 @@ class Trainer:
         lr_decay_start_step: int = 0,
         lr_decay_steps: int = 0,
         lr_decay_coeff: float = 1.0,
+        profile_flush_step: int = 100
     ):
         """Initializes the Trainer instance."""
         super().__init__()
 
         # --- PRNG Key Setup ---
         self.key = jax.random.PRNGKey(rng_seed)
+        self.profile_flush_step = profile_flush_step # Store the interval
 
         # EMA Configuration
         self.step_start_ema = step_start_ema
@@ -353,6 +358,21 @@ class Trainer:
         # --- Training Loop ---
         losses = []
         key = self.key
+        jax.profiler.start_server(9999) # For live profiling (e.g., Perfetto UI)
+
+        # --- File-based JAX Profiler Setup ---
+        if self.profile_flush_step > 0:
+            _trace_log_dir = self.tensorboard_dir # Using existing path for file traces
+            Path(_trace_log_dir).mkdir(parents=True, exist_ok=True) # Ensure directory exists
+            
+            # Start file tracing if an interval is set, or if the original logic implies it.
+            # The original code started it unconditionally. We will keep that, and control flushing with the interval.
+            jax.profiler.start_trace(_trace_log_dir, create_perfetto_link=False)
+            logging.info(f"JAX profiler file trace started. Traces will be saved to '{_trace_log_dir}'.")
+            if self.profile_flush_step > 0:
+                logging.info(f"File traces will be flushed at {self.profile_flush_step} steps.")
+
+
         while self.step < self.train_num_steps:
             # --- Split Key for the current step ---
             key, step_key = jax.random.split(key)
@@ -418,15 +438,13 @@ class Trainer:
                 except Exception as e:
                     logging.error(f"Error saving checkpoint at step {self.step}: {e}")
 
-            # --- Sampling (Needs Adaptation) ---
-            # if self.step != 0 and self.step % self.save_and_sample_every == 0:
-            #     milestone = self.step // self.save_and_sample_every
-            #     print(f"Step: {self.step} | Generating sample batch at milestone {milestone}...")
-            #     self.generate_samples(milestone) # Requires generate_samples method
-
             self.step += 1
-        # --- End of Training Loop ---
 
+            # --- Periodic Profiler Trace Flushing ---
+            if self.profile_flush_step > 0 and self.step == self.profile_flush_step:
+                jax.profiler.stop_trace()
+        # --- End of Training Loop ---
+        
         # Update self.key with the final state after the loop
         self.key = key
 

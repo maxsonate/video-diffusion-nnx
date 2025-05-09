@@ -42,7 +42,7 @@ class MovingMNIST(data.Dataset):
         self.arrays = rearrange(self.arrays, 'f b h w -> b f h w')
         # Add channel dimension: (b, c, f, h, w)
         self.arrays = self.arrays[:, None, ...]  # B C F H W
-        self.arrays = np.astype(self.arrays, np.float32)
+        self.arrays = self.arrays.astype(np.float32)
 
         # Partial function to cast sequences to the desired number of frames
         self.cast_num_frames_fn = partial(cast_num_frames, frames=num_frames) if force_num_frames else identity

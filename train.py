@@ -106,6 +106,7 @@ def main():
         lr_decay_start_step=trainer_cfg['lr_decay_start_step'],
         lr_decay_steps=trainer_cfg['lr_decay_steps'],
         lr_decay_coeff=trainer_cfg['lr_decay_coeff'],
+        profile_flush_step=trainer_cfg['profile_flush_step'],
         rng_seed=master_seed,
     )
 
