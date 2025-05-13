@@ -12,7 +12,7 @@ from pathlib import Path
 import torch.utils.data as data
 from itertools import cycle
 from torch.utils.tensorboard import SummaryWriter
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental import mesh_utils
 from functools import partial
 from flax import struct
@@ -116,7 +116,8 @@ class Trainer:
         lr_decay_start_step: int = 0,
         lr_decay_steps: int = 0,
         lr_decay_coeff: float = 1.0,
-        profile_flush_step: int = 100
+        profile_flush_step: int = 100,
+        num_model_shards: int = 1
     ):
         """Initializes the Trainer instance."""
         super().__init__()
@@ -163,10 +164,61 @@ class Trainer:
         self.per_device_bs = self.batch_size // self.n_devices
 
         # --- Create and Replicate Train State ---
-        # Create Mesh
-        self.mesh = Mesh(mesh_utils.create_device_mesh((self.n_devices,)), axis_names=('data',))
+        # Define model axis for model parallelism
+        self.num_model_shards = num_model_shards # Example: 2-stage pipeline.
+        assert self.n_devices % self.num_model_shards == 0, "Number of devices must be divisible by num_model_shards"
+        data_parallel_size = self.n_devices // self.num_model_shards
+        model_axis_name = 'model'
+        data_axis_name = 'data'
+        self.model_axis_name = model_axis_name # Store on self
+        self.data_axis_name = data_axis_name   # Store on self
 
-        # Create the initial state object on the host (only dynamic parts)
+        device_mesh = mesh_utils.create_device_mesh((data_parallel_size, self.num_model_shards))
+        self.mesh = Mesh(devices=device_mesh, axis_names=(self.data_axis_name, self.model_axis_name)) # Use self. attributes
+        logging.info(f"Created mesh with shape: {self.mesh.shape} and axis_names: {self.mesh.axis_names}")
+
+        # Parameters for Unet3D constructor (it now expects mesh and model_axis_name)
+        # This assumes self.model is an instance of the updated Unet3D
+        # If self.model was already instantiated, this change implies it needs re-instantiation
+        # or that its existing __init__ is compatible / mesh is set post-init.
+        # For NNX, this is fine as the model object definition itself is less tied to sharding
+        # until its parameters are extracted and sharded.
+        # We ensure the model object has these attributes if it uses them internally.
+        if hasattr(self.model, 'mesh') and hasattr(self.model, 'model_axis_name'):
+            self.model.mesh = self.mesh
+            self.model.model_axis_name = self.model_axis_name # Use self.attribute
+        
+        # Create parameter sharding rules
+        abstract_params = jax.tree_util.tree_map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), init_params)
+        
+        # Generate PartitionSpec PyTree for params
+        # Correctly convert diverse path entries (GetAttrKey, SequenceKey, DictKey) to strings.
+        _param_path_to_name_tuple = lambda path: tuple(Trainer._convert_path_entry_to_str(p) for p in path)
+        
+        state_param_sharding_spec = jax.tree_util.tree_map_with_path(
+            lambda path, x: self._get_param_sharding(_param_path_to_name_tuple(path), x),
+            abstract_params
+        )
+
+        # Sharding for opt_state: should mirror params sharding
+        # This assumes opt_state structure is a PyTree mirroring params, or that
+        # a similar path-based logic can apply.
+        # For Adam, states are often per-parameter.
+        abstract_opt_state = jax.tree_util.tree_map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype) if hasattr(x, 'shape') else x, init_opt_state)
+        # Create the optimizer state sharding spec using a helper method
+        opt_state_sharding_spec = Trainer._create_optimizer_sharding_spec(
+            state_param_sharding_spec,
+            abstract_opt_state
+        )
+        
+        # This creates a Pytree of PartitionSpecs for opt_state, mirroring params.
+        
+        ema_params_sharding_spec = jax.tree_util.tree_map(
+            Trainer._get_opt_or_ema_sharding,
+            state_param_sharding_spec,
+            abstract_params # EMA params mirror original params structure
+        )
+
         host_state = NnxTrainState(
             params=init_params,
             opt_state=init_opt_state,
@@ -174,7 +226,19 @@ class Trainer:
             # graphdef and tx are kept as self.graphdef, self.tx
         )
 
-        self.state = host_state
+        train_state_sharding_specs_tree = NnxTrainState(
+            params=state_param_sharding_spec,
+            opt_state=opt_state_sharding_spec,
+            ema_params=ema_params_sharding_spec
+        )
+        
+        self.train_state_sharding = jax.tree_util.tree_map(
+            lambda spec: NamedSharding(self.mesh, spec),
+            train_state_sharding_specs_tree
+        )
+        
+        self.state = host_state # Pass host state to pjit, in_shardings will handle it
+
         # --- Dataset and Dataloader ---
         self.image_size = diffusion_model.image_size
         model_num_frames = diffusion_model.num_frames
@@ -240,31 +304,32 @@ class Trainer:
         self.add_loss_plot = add_loss_plot
 
         # Define pjit'd train step with shardings
+        _p_train_step_in_shardings = (
+            self.train_state_sharding,  # <--- HERE it is used for the input state
+            NamedSharding(self.mesh, P(self.data_axis_name, None)),  # batch_data
+            NamedSharding(self.mesh, P()),  # key
+            NamedSharding(self.mesh, P()),  # step
+            # Static args don't need shardings here
+             NamedSharding(self.mesh, P()), # step_start_ema
+             NamedSharding(self.mesh, P()), # update_ema_every
+             NamedSharding(self.mesh, P())  # ema_decay
+        )
+        _p_train_step_out_shardings = (
+            self.train_state_sharding, # <--- AND HERE for the output state
+            NamedSharding(self.mesh, P())   # loss
+        )
+
         @partial(pjit,
-                 # Define shardings for inputs and outputs
-                 # Use the Trainer's mesh for all sharding specifications
-                 in_shardings=(
-                     jax.sharding.NamedSharding(self.mesh, P()),         # state (replicated)
-                     jax.sharding.NamedSharding(self.mesh, P('data')),  # batch_data (sharded along 'data')
-                     jax.sharding.NamedSharding(self.mesh, P()),         # key (replicated)
-                     jax.sharding.NamedSharding(self.mesh, P()),         # step (replicated)
-                     jax.sharding.NamedSharding(self.mesh, P()),         # step_start_ema (replicated)
-                     jax.sharding.NamedSharding(self.mesh, P()),         # update_ema_every (replicated)
-                     jax.sharding.NamedSharding(self.mesh, P()),         # ema_decay (replicated)
-                 ),
-                 out_shardings=(
-                     jax.sharding.NamedSharding(self.mesh, P()),         # new_state (replicated)
-                     jax.sharding.NamedSharding(self.mesh, P())          # loss (replicated)
-                 ),
-                 # Specify arguments that are static across calls (affect compilation)
-                 static_argnums=(4, 5, 6) # graphdef, tx, use_path_as_cond
+                 in_shardings=_p_train_step_in_shardings, # <--- Passed to pjit
+                 out_shardings=_p_train_step_out_shardings, # <--- Passed to pjit
+                 static_argnums=(4, 5, 6) 
                 )
         def _pjit_train_step(state: NnxTrainState, batch_data, key, step: int,
-                              graphdef: nnx.GraphDef,
-                              tx: optax.GradientTransformation,
-                              use_path_as_cond: bool,
-                              step_start_ema: int,
-                              update_ema_every: int,
+                              graphdef: nnx.GraphDef, 
+                              tx: optax.GradientTransformation, 
+                              use_path_as_cond: bool, 
+                              step_start_ema: int, 
+                              update_ema_every: int, 
                               ema_decay: float):
             """Performs a single training step on each device."""
 
@@ -325,6 +390,104 @@ class Trainer:
             return new_state, loss
 
         self.p_train_step = _pjit_train_step
+
+    @staticmethod
+    def _convert_path_entry_to_str(p):
+        if isinstance(p, jax.tree_util.GetAttrKey):
+            return p.name
+        elif isinstance(p, jax.tree_util.SequenceKey):
+            return str(p.idx) # Convert index to string for consistency in the path tuple
+        elif isinstance(p, jax.tree_util.DictKey):
+            return p.key # DictKey often has a .key attribute that is the actual key
+        elif hasattr(p, 'key') and p.key is not None: # Fallback for other key-like objects
+            return str(p.key) # Or p.key if it's already a string
+        else:
+            return str(p) # Generic fallback
+
+    def _get_param_sharding(self, param_path_tuple, param_leaf):
+        # Initialize all parameter dimensions to be replicated on all mesh axes
+        param_spec_list = [None] * param_leaf.ndim 
+
+        leaf_name = param_path_tuple[-1] if param_path_tuple else ""
+
+        # Model parallelism for specific layers' weights and biases:
+        # Shard the last dimension of kernels/weights and biases along the self.model_axis_name.
+        # Parameters are replicated by default on other mesh axes (including data_axis_name).
+        is_kernel_or_weight = leaf_name in ['kernel', 'w']
+        is_bias = leaf_name == 'bias' # For nnx.Conv bias
+        if leaf_name == 'b' and any(parent_key in str(param_path_tuple) for parent_key in ['Linear', 'mlp']): # Heuristic for nnx.Linear bias
+            is_bias = True
+
+        if param_leaf.ndim > 0 and (is_kernel_or_weight or is_bias):
+            param_spec_list[-1] = self.model_axis_name # Target last dim for model sharding
+            # If param_leaf.ndim == 1 (e.g. bias), its single dimension is now sharded on self.model_axis_name.
+            # All other dimensions (if any) remain None, meaning replicated on other mesh axes (like data_axis_name).
+
+        return P(*param_spec_list) if param_leaf.ndim > 0 else P() # For scalar params (fully replicated)
+
+    @staticmethod
+    def _get_opt_or_ema_sharding(param_sharding_spec_leaf, opt_ema_leaf_struct):
+        # If opt_ema_leaf is scalar or not a JAX type, replicate.
+        if not hasattr(opt_ema_leaf_struct, 'ndim') or opt_ema_leaf_struct.ndim == 0:
+            return P()
+        # Else, use the sharding spec of the corresponding parameter.
+        return param_sharding_spec_leaf
+
+    @staticmethod
+    def _create_optimizer_sharding_spec(state_param_sharding_spec, abstract_opt_state):
+        """Creates the sharding specification Pytree for the optimizer state.
+        
+        Handles typical Optax optimizer structures (like AdamState or a tuple containing it)
+        where parts of the state (e.g., mu, nu) mirror the parameter structure,
+        while others (e.g., count) are scalars or other simple states.
+        """
+        # Optax optimizer states can be tuples, where the Adam-like state
+        # (with mu, nu, count) is often the first element.
+        if not isinstance(abstract_opt_state, tuple):
+            # If it's not a tuple, assume it's the Adam-like state directly (e.g. ScaleByAdamState)
+            adam_like_state_abstract = abstract_opt_state
+            other_states_abstract = ()
+        else:
+            # Assuming the first element is the one with mu, nu, count (e.g., ScaleByAdamState)
+            adam_like_state_abstract = abstract_opt_state[0]
+            other_states_abstract = abstract_opt_state[1:]
+
+        # mu and nu fields have PyTrees matching params structure, accessed from adam_like_state_abstract
+        mu_sharding_spec = jax.tree_util.tree_map(
+            Trainer._get_opt_or_ema_sharding, # Use the static helper
+            state_param_sharding_spec, # Structure for params
+            adam_like_state_abstract.mu # mu part of the identified Adam-like state
+        )
+        nu_sharding_spec = jax.tree_util.tree_map(
+            Trainer._get_opt_or_ema_sharding, # Use the static helper
+            state_param_sharding_spec, # Structure for params
+            adam_like_state_abstract.nu  # nu part of the identified Adam-like state
+        )
+        # Optimizer state often has a scalar 'count' component in its Adam-like part.
+        count_sharding_spec = P() # Assuming count is always a scalar and replicated
+
+        # Reconstruct the sharding for the Adam-like part of the state
+        try:
+            adam_like_sharding_spec = type(adam_like_state_abstract)(
+                count=count_sharding_spec,
+                mu=mu_sharding_spec,
+                nu=nu_sharding_spec
+            )
+        except TypeError as e:
+            logging.error(f"Error creating Adam-like part of optimizer sharding spec. Check structure: {e}")
+            logging.error(f"Adam-like Abstract State Type: {type(adam_like_state_abstract)}")
+            logging.error(f"Adam-like Abstract State: {adam_like_state_abstract}")
+            raise ValueError("Could not construct Adam-like sharding spec, incompatible structure.") from e
+
+        # Reconstruct the full optimizer state sharding spec (tuple or single object)
+        if not isinstance(abstract_opt_state, tuple):
+            optimizer_sharding_spec = adam_like_sharding_spec
+        else:
+            # Shard other states in the tuple (often EmptyState, which is scalar-like)
+            other_sharding_specs = tuple(P() for _ in other_states_abstract) # Assume replicated
+            optimizer_sharding_spec = (adam_like_sharding_spec,) + other_sharding_specs
+            
+        return optimizer_sharding_spec
 
     def sample_batch(self, batch_size):
         """(Placeholder) Sample a single batch of videos.

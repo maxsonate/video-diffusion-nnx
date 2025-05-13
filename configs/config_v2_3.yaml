@@ -1,6 +1,6 @@
 unet:
   # Parameters for Unet3D
-  dim: 32                # Base channel dimension
+  dim: 128                # Base channel dimension
   rngs_seed: 0           # Seed for nnx.Rngs
   dim_mults: [1, 2, 4, 8]
   channels: 1
@@ -18,7 +18,7 @@ trainer:
   # Parameters for the training process
   folder: "./results/v2_3"
   dataset_path: "data/mnist_test_seq_100.npy"
-  train_batch_size: 16
+  train_batch_size: 4
   train_lr: 0.0001
   train_num_steps: 100000
   lr_decay_start_step: 80000
@@ -35,7 +35,7 @@ trainer:
   use_path_as_cond: false
   sample_text: null
   cond_scale: 2.0
-  checkpoint_every_steps: 10
+  checkpoint_every_steps: 100
   checkpoint_dir_path: ""
   add_loss_plot: false
   resume_training_step: 0
@@ -43,3 +43,4 @@ trainer:
   max_to_keep: 100
   ema_decay: 0.995
   profile_flush_step: 100
+  num_model_shards: 2 # increase to 2 for 2-stage pipeline

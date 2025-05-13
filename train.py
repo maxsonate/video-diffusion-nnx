@@ -108,6 +108,7 @@ def main():
         lr_decay_coeff=trainer_cfg['lr_decay_coeff'],
         profile_flush_step=trainer_cfg['profile_flush_step'],
         rng_seed=master_seed,
+        num_model_shards=trainer_cfg['num_model_shards'],
     )
 
     # TODO: Add loading from checkpoint before starting training
